@@ -1,11 +1,31 @@
 import streamlit as st
+import sys
+import subprocess
+import importlib
+
+# ==========================================
+# 0. 强制安装依赖 (自动修复报错)
+# ==========================================
+# 这段代码会自动检测并安装缺失的库，无需配置 requirements.txt
+required_libraries = ["openpyxl", "xlsxwriter", "xlrd", "pandas"]
+
+for lib in required_libraries:
+    try:
+        importlib.import_module(lib)
+    except ImportError:
+        # 如果报错，说明没安装，利用命令行强制安装
+        subprocess.check_call([sys.executable, "-m", "pip", "install", lib])
+
+# ==========================================
+# 下面是原本的主程序代码
+# ==========================================
 import pandas as pd
 import io
 
 # ==========================================
 # 1. 基础配置
 # ==========================================
-st.set_page_config(page_title="核对订单状态", layout="wide", page_icon="🧩")
+st.set_page_config(page_title="高级智能调拨系统 V3.0", layout="wide", page_icon="🧩")
 
 hide_st_style = """
     <style>
@@ -17,7 +37,7 @@ hide_st_style = """
     </style>
     """
 st.markdown(hide_st_style, unsafe_allow_html=True)
-st.title("核对订单状态")
+st.title("🧩 智能库存分配 V3.0 (混合扣减策略)")
 
 # ==========================================
 # 2. 核心：库存管理器 (支持部分取货)
