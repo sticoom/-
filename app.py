@@ -17,16 +17,16 @@ hide_st_style = """
     </style>
     """
 st.markdown(hide_st_style, unsafe_allow_html=True)
-st.title("🦁 智能库存分配 V6.0 (US整单优先+SKU聚合输出)")
+st.title("🦁 智能库存分配 V6.0 (US整单优先+非US混合补足)")
 
 # ==========================================
 # 2. 核心：库存管理器
 # ==========================================
 class InventoryManager:
     def __init__(self, df_inv, df_po):
-        # stock[sku][fnsku][wh_type] = quantity
+        # 库存结构: self.stock[sku][fnsku][wh_type] = quantity
         self.stock = {}
-        # po[sku] = quantity
+        # PO结构: self.po[sku] = quantity
         self.po = {}
         
         self._init_inventory(df_inv)
@@ -63,37 +63,41 @@ class InventoryManager:
     def get_sku_snapshot(self, sku):
         """获取某SKU当前各维度的总库存(用于输出表展示剩余量)"""
         res = {'外协': 0, '云仓': 0, '深仓': 0, 'PO': 0}
-        
-        # 统计现货
         if sku in self.stock:
             for f_key in self.stock[sku]:
                 for w_type in ['外协', '云仓', '深仓']:
                     res[w_type] += self.stock[sku][f_key].get(w_type, 0)
-        # 统计PO
         res['PO'] = self.po.get(sku, 0)
         return res
 
-    def check_single_source_capacity(self, sku, wh_type):
+    # --- 新增功能：巡检能力 (只看不扣) ---
+    def check_max_availability(self, sku, target_fnsku, src_type, src_name):
         """
-        检查某仓库(wh_type)针对某SKU的总可用量(含所有FNSKU)
-        用于判断是否能整单满足
+        计算某个特定源（如'外协'）能提供的最大库存量。
+        包含：精确FNSKU库存 + 同SKU下其他FNSKU的库存(加工)
         """
-        total = 0
-        if sku in self.stock:
-            for f_key in self.stock[sku]:
-                total += self.stock[sku][f_key].get(wh_type, 0)
-        return total
+        total_avail = 0
+        
+        if src_type == 'stock':
+            if sku in self.stock:
+                # 1. 精确匹配
+                if target_fnsku in self.stock[sku]:
+                    total_avail += self.stock[sku][target_fnsku].get(src_name, 0)
+                # 2. 替代品(加工)
+                for other_f in self.stock[sku]:
+                    if other_f == target_fnsku: continue
+                    total_avail += self.stock[sku][other_f].get(src_name, 0)
+        
+        elif src_type == 'po':
+            if sku in self.po:
+                total_avail += self.po[sku]
+                
+        return total_avail
 
-    def check_po_capacity(self, sku):
-        return self.po.get(sku, 0)
-
-    # --- 核心分配算法 ---
-    def allocate_strict(self, sku, target_fnsku, qty_needed, strategy_chain):
+    # --- 核心扣减执行 (执行真实的扣除) ---
+    def execute_deduction(self, sku, target_fnsku, qty_needed, strategy_chain):
         """
-        params:
-            strategy_chain: [('stock', '深仓'), ('stock', '外协'), ('po', '采购订单')]
-        return:
-            filled_qty, details_list, sources_set
+        按照给定的策略链进行真实扣减 (瀑布流执行)
         """
         qty_remain = qty_needed
         breakdown_notes = []
@@ -114,7 +118,7 @@ class InventoryManager:
                         qty_remain -= take
                         step_taken += take
                         
-                # 2. 加工补足 (同SKU换FNSKU)
+                # 2. 加工补足
                 if qty_remain > 0 and sku in self.stock:
                     for other_f in self.stock[sku]:
                         if other_f == target_fnsku: continue
@@ -145,7 +149,7 @@ class InventoryManager:
         return filled_qty, breakdown_notes, used_sources
 
 # ==========================================
-# 3. 辅助函数
+# 3. 辅助逻辑
 # ==========================================
 def smart_col(df, candidates):
     cols = [str(c).strip() for c in df.columns]
@@ -154,35 +158,17 @@ def smart_col(df, candidates):
             if cand in c: return c
     return None
 
-def get_strategy_us_atomic(inv_mgr, sku, qty_needed):
-    """
-    US 特供逻辑：
-    尽量用单一仓库满足整个需求。
-    优先级：外协 -> 云仓 -> 深仓 -> PO
-    如果单仓都不满足，则返回降级的混合策略。
-    """
-    # 1. 检查外协是否能整单满足
-    if inv_mgr.check_single_source_capacity(sku, '外协') >= qty_needed:
-        return [('stock', '外协')]
+def get_strategy_priority(country_str):
+    """获取基础优先级列表"""
+    c = str(country_str).upper().strip()
+    is_us = 'US' in c or '美国' in c
     
-    # 2. 检查云仓
-    if inv_mgr.check_single_source_capacity(sku, '云仓') >= qty_needed:
-        return [('stock', '云仓')]
-
-    # 3. 检查深仓
-    if inv_mgr.check_single_source_capacity(sku, '深仓') >= qty_needed:
-        return [('stock', '深仓')]
-
-    # 4. 检查PO
-    if inv_mgr.check_po_capacity(sku) >= qty_needed:
-        return [('po', '采购订单')]
-
-    # 5. 都不满足，降级为混合拼接 (外协->云仓->深仓->PO)
-    return [('stock', '外协'), ('stock', '云仓'), ('stock', '深仓'), ('po', '采购订单')]
-
-def get_strategy_non_us():
-    """非US逻辑：深仓 -> 外协 -> 云仓 -> PO (混合补足)"""
-    return [('stock', '深仓'), ('stock', '外协'), ('stock', '云仓'), ('po', '采购订单')]
+    if is_us:
+        # US优先级: 外协 -> 云仓 -> 深仓 -> PO
+        return [('stock', '外协'), ('stock', '云仓'), ('stock', '深仓'), ('po', '采购订单')], True
+    else:
+        # 非US优先级: 深仓 -> 外协 -> 云仓 -> PO
+        return [('stock', '深仓'), ('stock', '外协'), ('stock', '云仓'), ('po', '采购订单')], False
 
 def load_file(file, type_tag):
     if not file: return None
@@ -196,11 +182,51 @@ def load_file(file, type_tag):
         return None
 
 # ==========================================
-# 4. 业务逻辑主流程
+# 4. 智能分配控制中心 (大脑)
+# ==========================================
+def smart_allocate(mgr, sku, fnsku, qty, country):
+    """
+    根据国家自动选择分配模式：
+    - US: 整单优先 (Atomic) -> 失败则降级为混合
+    - Non-US: 混合补足 (Waterfall)
+    """
+    base_priority, is_us = get_strategy_priority(country)
+    
+    final_strategy = []
+    
+    if is_us:
+        # === US 模式：整单巡检 ===
+        atomic_source_found = None
+        
+        # 1. 巡检：看谁能独立吃下这一单
+        for src_type, src_name in base_priority:
+            # 检查该仓库/PO的总可用量（含加工）
+            max_avail = mgr.check_max_availability(sku, fnsku, src_type, src_name)
+            
+            if max_avail >= qty:
+                atomic_source_found = (src_type, src_name)
+                break # 找到了！停止巡检
+        
+        if atomic_source_found:
+            # 找到了能整单满足的源，策略只包含这一个源
+            final_strategy = [atomic_source_found]
+        else:
+            # 单仓都搞不定，降级为混合模式（用全部优先级去凑）
+            final_strategy = base_priority
+            
+    else:
+        # === 非US 模式：混合补足 ===
+        final_strategy = base_priority
+
+    # 执行最终的扣减
+    return mgr.execute_deduction(sku, fnsku, qty, final_strategy)
+
+# ==========================================
+# 5. 业务主流程
 # ==========================================
 def run_full_process(df_demand, inv_mgr, df_plan):
     
-    # --- 阶段一：提货计划预扣减 (清洗库存) ---
+    # --- 阶段一：提货计划预扣减 (逻辑同构) ---
     if df_plan is not None and not df_plan.empty:
         p_sku = smart_col(df_plan, ['SKU', 'sku'])
         p_fnsku = smart_col(df_plan, ['FNSKU', 'FnSKU'])
@@ -213,80 +239,65 @@ def run_full_process(df_demand, inv_mgr, df_plan):
                 fnsku = str(row[p_fnsku]).strip() if p_fnsku else ""
                 try: qty = float(row[p_qty])
                 except: qty = 0
+                
                 if qty <= 0: continue
                 
+                # 获取国家 (默认非US以保持混合逻辑，除非明确指定)
                 cty = str(row[p_country]) if p_country else "Non-US"
-                is_us = 'US' in cty.upper() or '美国' in cty
                 
-                # 计划表扣减也遵循同样的逻辑
-                if is_us:
-                    strategy = get_strategy_us_atomic(inv_mgr, sku, qty)
-                else:
-                    strategy = get_strategy_non_us()
-                
-                inv_mgr.allocate_strict(sku, fnsku, qty, strategy)
+                # 调用智能分配 (不记录结果，只消耗库存)
+                smart_allocate(inv_mgr, sku, fnsku, qty, cty)
 
-    # --- 阶段二：分配需求 ---
+    # --- 阶段二：需求表分配 ---
     
     # 1. 准备数据
     df = df_demand.copy()
     df['需求数量'] = pd.to_numeric(df['需求数量'], errors='coerce').fillna(0)
     df = df[df['需求数量'] > 0]
     
-    # 2. 优先级排序 (确保高优先级先分配)
-    def get_calc_rank(row):
+    # 2. 排序 (新增非US > 新增US > 当周非US > 当周US)
+    def get_sort_key(row):
         tag = str(row.get('标签列', '')).strip()
         cty = str(row.get('国家', '')).strip().upper()
-        # 越小越优先
         base_score = 10 if '新增' in tag else 30
         country_offset = 1 if ('US' in cty or '美国' in cty) else 0
         return base_score + country_offset
 
-    df['calc_rank'] = df.apply(get_calc_rank, axis=1)
-    # 先按优先级算，分配库存
-    df_calc = df.sort_values(by=['calc_rank', '国家'])
+    df['sort_key'] = df.apply(get_sort_key, axis=1)
+    # 关键：先按 SKU 排序，再按优先级排序
+    df_sorted = df.sort_values(by=['SKU', 'sort_key', '国家'])
     
     results = []
     
-    # 3. 逐行分配
-    for idx, row in df_calc.iterrows():
+    # 3. 逐行执行
+    for idx, row in df_sorted.iterrows():
         sku = str(row['SKU']).strip()
         fnsku = str(row['FNSKU']).strip()
         country = str(row['国家']).strip()
         qty_needed = row['需求数量']
         tag = row['标签列']
         
-        is_us = 'US' in country.upper() or '美国' in country
+        # 调用智能分配
+        filled, notes, sources = smart_allocate(inv_mgr, sku, fnsku, qty_needed, country)
         
-        # 获取策略
-        if is_us:
-            # US: 尝试单仓满足，不行则降级
-            strategy = get_strategy_us_atomic(inv_mgr, sku, qty_needed)
-        else:
-            # 非US: 混合瀑布流
-            strategy = get_strategy_non_us()
-        
-        # 执行分配
-        filled, notes, sources = inv_mgr.allocate_strict(sku, fnsku, qty_needed, strategy)
-        
-        # 状态判定
+        # 状态生成
         status = ""
         wait_qty = qty_needed - filled
         
         if wait_qty == 0:
-            status = "+".join(sources) if sources else "库存异常"
+            status = "+".join(sources) if sources else "库存异常(无来源)"
         elif filled > 0:
             status = f"部分缺货(缺{wait_qty}):{'+'.join(sources)}"
         else:
             status = f"待下单(需{qty_needed})"
             
-        # 获取快照
+        # 快照
         snap = inv_mgr.get_sku_snapshot(sku)
         
-        # 组装结果 (按用户要求的输出顺序)
+        # 输出结构重构
         res_row = {
             "SKU": sku,
-            "标签列": tag,
+            "需求标签": tag,
             "国家": country,
             "FNSKU": fnsku,
             "需求数量": qty_needed,
@@ -298,18 +309,11 @@ def run_full_process(df_demand, inv_mgr, df_plan):
             "剩余PO": snap['PO']
         }
         results.append(res_row)
-    
-    # 4. 最终输出排序 (按SKU聚合，方便查看)
-    df_final = pd.DataFrame(results)
-    if not df_final.empty:
-        # 自定义排序: SKU -> 标签 -> 国家
-        # 注意：这里只是为了好看，库存已经分配完了
-        df_final = df_final.sort_values(by=['SKU', '标签列', '国家'])
         
-    return df_final
+    return pd.DataFrame(results)
 
 # ==========================================
-# 5. UI 界面
+# 6. UI 界面
 # ==========================================
 col_left, col_right = st.columns([35, 65])
 
@@ -326,7 +330,7 @@ with col_left:
 
 with col_right:
     st.subheader("2. 引用表格上传")
-    st.info("💡 逻辑：非US混合补足 | US整单优先(外协>云仓>深仓>PO)")
+    st.info("💡 逻辑：非US(混合补足) | US(整单优先,不够则混合)")
     
     f_inv = st.file_uploader("📂 A. 在库库存表", type=['xlsx', 'xls', 'csv'])
     f_po = st.file_uploader("📂 B. 采购订单追踪表", type=['xlsx', 'xls', 'csv'])
@@ -338,7 +342,7 @@ with col_right:
         if not (f_inv and f_po and f_plan):
             st.error("❌ 请上传所有3个必要文件！")
         else:
-            with st.spinner("正在进行多策略库存分配..."):
+            with st.spinner("正在执行 V6.0 双轨分配算法..."):
                 try:
                     df_inv_raw = load_file(f_inv, "库存表")
                     df_po_raw = load_file(f_po, "采购表")
@@ -363,7 +367,7 @@ with col_right:
                         final_df = run_full_process(df_input, mgr, df_plan_raw)
                         
                         if final_df.empty:
-                            st.warning("⚠️ 结果为空，请检查是否有有效的需求数量。")
+                            st.warning("⚠️ 结果为空。")
                         else:
                             st.success(f"✅ 运算完成！")
                             st.dataframe(final_df, use_container_width=True)
@@ -371,7 +375,7 @@ with col_right:
                             buf = io.BytesIO()
                             with pd.ExcelWriter(buf, engine='xlsxwriter') as writer:
                                 final_df.to_excel(writer, index=False)
-                            st.download_button("📥 下载结果.xlsx", buf.getvalue(), "V6_Allocation.xlsx", "application/vnd.ms-excel")
+                            st.download_button("📥 下载 V6 结果.xlsx", buf.getvalue(), "V6_Allocation.xlsx", "application/vnd.ms-excel")
 
                 except Exception as e:
                     st.error(f"运行错误: {str(e)}")
