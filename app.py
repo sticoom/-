@@ -5,7 +5,7 @@ import io
 # ==========================================
 # 1. 基础配置
 # ==========================================
-st.set_page_config(page_title="高级智能调拨系统 V3.0", layout="wide", page_icon="🧩")
+st.set_page_config(page_title="智能调拨系统", layout="wide", page_icon="🧩")
 
 hide_st_style = """
     <style>
@@ -17,7 +17,7 @@ hide_st_style = """
     </style>
     """
 st.markdown(hide_st_style, unsafe_allow_html=True)
-st.title("🧩 智能库存分配 V3.0 (混合扣减策略)")
+st.title("🧩 核库存状态")
 
 # ==========================================
 # 2. 核心：库存管理器 (支持部分取货)
