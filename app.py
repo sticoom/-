@@ -5,7 +5,7 @@ import io
 # ==========================================
 # 1. 基础配置
 # ==========================================
-st.set_page_config(page_title="高级智能调拨系统 V4.0", layout="wide", page_icon="🦁")
+st.set_page_config(page_title="高级智能调拨系统 V5.0", layout="wide", page_icon="🦁")
 
 hide_st_style = """
     <style>
@@ -17,16 +17,16 @@ hide_st_style = """
     </style>
     """
 st.markdown(hide_st_style, unsafe_allow_html=True)
-st.title("🦁 智能库存分配 V4.0 (双重清洗+深度加工逻辑)")
+st.title("🦁 智能库存分配 V5.0 (严谨逻辑+实时库存快照)")
 
 # ==========================================
-# 2. 核心：库存管理器 (State Machine)
+# 2. 核心：库存管理器
 # ==========================================
 class InventoryManager:
     def __init__(self, df_inv, df_po):
-        # 结构: self.stock[sku][fnsku][wh_type] = quantity
+        # 库存结构: self.stock[sku][fnsku][wh_type] = quantity
         self.stock = {}
-        # 结构: self.po[sku] = quantity
+        # PO结构: self.po[sku] = quantity
         self.po = {}
         
         self._init_inventory(df_inv)
@@ -60,52 +60,53 @@ class InventoryManager:
             if q > 0 and s:
                 self.po[s] = self.po.get(s, 0) + q
 
-    def get_current_sku_stock(self, sku):
-        """获取该SKU当前所有仓库+PO的总库存 (用于展示)"""
-        total = 0
-        # 加库存
+    def get_sku_snapshot(self, sku):
+        """获取某SKU当前各维度的总库存(用于输出表展示剩余量)"""
+        res = {'外协': 0, '云仓': 0, '深仓': 0, 'PO': 0}
+        
+        # 统计现货
         if sku in self.stock:
             for f_key in self.stock[sku]:
-                for w_type in self.stock[sku][f_key]:
-                    total += self.stock[sku][f_key][w_type]
-        # 加PO
-        if sku in self.po:
-            total += self.po[sku]
-        return total
+                for w_type in ['外协', '云仓', '深仓']:
+                    res[w_type] += self.stock[sku][f_key].get(w_type, 0)
+        # 统计PO
+        res['PO'] = self.po.get(sku, 0)
+        return res
 
-    # --- 通用分配核心逻辑 (Waterfall) ---
-    def allocate_waterfall(self, sku, target_fnsku, qty_needed, strategy_chain):
+    # --- 核心分配算法 (严谨逻辑版) ---
+    def allocate_strict(self, sku, target_fnsku, qty_needed, strategy_chain):
         """
-        核心瀑布流分配函数
         params:
-            strategy_chain: list of tuples [('stock', '深仓'), ('stock', '外协'), ('po', '采购订单')]
+            strategy_chain: [('stock', '深仓'), ('stock', '外协'), ('po', '采购订单')]
         return:
-            filled_qty: 实际分配的数量
-            details_str: 备注明细 (例如: 深仓+外协加工)
-            sources_list: 来源列表 (例如: ['深仓', '外协'])
+            filled_qty, details_list, sources_set
         """
         qty_remain = qty_needed
         breakdown_notes = []
         used_sources = []
         
+        # 遍历策略链（例如：先看深仓，再看外协...）
         for src_type, src_name in strategy_chain:
             if qty_remain <= 0: break
             
-            taken_in_this_step = 0
+            step_taken = 0
             
             if src_type == 'stock':
-                # A. 先扣减精确匹配 (SKU + FNSKU)
+                # === 仓库内部逻辑开始 ===
+                
+                # 1. 精确匹配 (Same SKU + Same FNSKU)
                 if sku in self.stock and target_fnsku in self.stock[sku]:
                     avail = self.stock[sku][target_fnsku].get(src_name, 0)
                     take = min(avail, qty_remain)
                     if take > 0:
                         self.stock[sku][target_fnsku][src_name] -= take
                         qty_remain -= take
-                        taken_in_this_step += take
-                
-                # B. 如果该仓库还有缺口，扣减加工匹配 (SKU + 其他FNSKU)
+                        step_taken += take
+                        # 精确匹配通常不需要在备注里写太细，除非为了调试
+                        
+                # 2. 加工补足 (Same SKU + Diff FNSKU)
+                # 只有当精确匹配扣完后，且仍有需求，才在【当前仓库】找替代品
                 if qty_remain > 0 and sku in self.stock:
-                    # 遍历该SKU下该仓库的其他FNSKU
                     for other_f in self.stock[sku]:
                         if other_f == target_fnsku: continue # 跳过自己
                         if qty_remain <= 0: break
@@ -115,26 +116,28 @@ class InventoryManager:
                         if take > 0:
                             self.stock[sku][other_f][src_name] -= take
                             qty_remain -= take
-                            taken_in_this_step += take
+                            step_taken += take
                             breakdown_notes.append(f"{src_name}加工(用{other_f}补{take})")
+                
+                # === 仓库内部逻辑结束 ===
             
             elif src_type == 'po':
-                # C. 扣减PO (只看SKU)
+                # PO 逻辑 (只看 SKU)
                 if sku in self.po:
                     avail = self.po[sku]
                     take = min(avail, qty_remain)
                     if take > 0:
                         self.po[sku] -= take
                         qty_remain -= take
-                        taken_in_this_step += take
+                        step_taken += take
             
-            if taken_in_this_step > 0:
+            # 如果在这个节点取到了货，记录来源
+            if step_taken > 0:
                 if src_name not in used_sources:
                     used_sources.append(src_name)
         
         filled_qty = qty_needed - qty_remain
-        details_str = "; ".join(breakdown_notes)
-        return filled_qty, details_str, used_sources
+        return filled_qty, breakdown_notes, used_sources
 
 # ==========================================
 # 3. 辅助函数
@@ -174,14 +177,14 @@ def load_file(file, type_tag):
 # ==========================================
 def run_full_process(df_demand, inv_mgr, df_plan):
     
-    # --- 阶段一：执行提货计划预扣减 (The Plan) ---
-    # 逻辑：遍历计划表，根据计划表的国家，执行同样的仓库扣减逻辑
+    # --- 阶段一：提货计划预扣减 (清洗库存) ---
     if df_plan is not None and not df_plan.empty:
-        # 识别计划表列名
+        # 识别列名
         p_sku = smart_col(df_plan, ['SKU', 'sku'])
         p_fnsku = smart_col(df_plan, ['FNSKU', 'FnSKU'])
         p_qty = smart_col(df_plan, ['需求', '计划', '数量'])
-        p_country = smart_col(df_plan, ['国家', 'Country']) # 假设计划表也有国家，如果没有默认非US
+        # 提货计划表里如果没有国家列，默认非US处理，或者您可以指定
+        p_country = smart_col(df_plan, ['国家', 'Country']) 
         
         if p_sku and p_qty:
             for _, row in df_plan.iterrows():
@@ -194,33 +197,33 @@ def run_full_process(df_demand, inv_mgr, df_plan):
                 
                 if qty <= 0: continue
                 
-                # 确定计划的扣减策略
+                # 获取策略 (如果计划表没国家，默认按非US策略扣，或者最严格策略)
                 cty = str(row[p_country]) if p_country else "Non-US"
                 strategy = get_strategy(cty)
                 
-                # 执行静默扣减 (不记录结果，只为了减少库存)
-                inv_mgr.allocate_waterfall(sku, fnsku, qty, strategy)
+                # 执行扣减 (不记录结果，仅消耗库存)
+                inv_mgr.allocate_strict(sku, fnsku, qty, strategy)
 
-    # --- 阶段二：执行需求分配 (The Demand) ---
+    # --- 阶段二：分配需求 ---
     
-    # 1. 数据清洗与排序
+    # 1. 准备数据
     df = df_demand.copy()
     df['需求数量'] = pd.to_numeric(df['需求数量'], errors='coerce').fillna(0)
     df = df[df['需求数量'] > 0]
     
-    # 2. 优先级排序 (Sort Key)
-    # 顺序: 新增非US(10) > 新增US(20) > 当周非US(30) > 当周US(40)
+    # 2. 优先级排序
+    # 顺序: 新增非US(1) > 新增US(2) > 当周非US(3) > 当周US(4)
     def get_sort_key(row):
         tag = str(row.get('标签列', '')).strip()
         cty = str(row.get('国家', '')).strip().upper()
         
         base_score = 10 if '新增' in tag else 30
-        country_offset = 10 if ('US' in cty or '美国' in cty) else 0
+        country_offset = 1 if ('US' in cty or '美国' in cty) else 0
         
         return base_score + country_offset
 
     df['sort_key'] = df.apply(get_sort_key, axis=1)
-    df_sorted = df.sort_values(by=['sort_key', '国家']) # 同优先级下按国家排序
+    df_sorted = df.sort_values(by=['sort_key', '国家'])
     
     results = []
     
@@ -230,37 +233,41 @@ def run_full_process(df_demand, inv_mgr, df_plan):
         fnsku = str(row['FNSKU']).strip()
         country = str(row['国家']).strip()
         qty_needed = row['需求数量']
-        
-        # 获取当前剩余库存快照 (仅供参考)
-        current_stock_snapshot = inv_mgr.get_current_sku_stock(sku)
+        tag = row['标签列']
         
         # 获取策略
         strategy = get_strategy(country)
         
         # 执行分配
-        filled, note_str, sources = inv_mgr.allocate_waterfall(sku, fnsku, qty_needed, strategy)
+        filled, notes, sources = inv_mgr.allocate_strict(sku, fnsku, qty_needed, strategy)
         
-        # 生成状态文本
+        # 状态判定
         status = ""
         wait_qty = qty_needed - filled
         
         if wait_qty == 0:
-            status = "+".join(sources) # 完全满足
+            status = "+".join(sources) if sources else "库存满足(无来源?)"
+            if not sources and filled > 0: status = "库存异常"
         elif filled > 0:
             status = f"部分缺货(缺{wait_qty}):{'+'.join(sources)}"
         else:
             status = f"待下单(需{qty_needed})"
             
-        # 组装结果行
+        # 获取当前剩余库存快照 (Snapshot)
+        snap = inv_mgr.get_sku_snapshot(sku)
+        
+        # 组装结果 (按用户要求的顺序)
         res_row = {
-            "当前可用库存(SKU总计)": current_stock_snapshot, # 放在第一列方便看
-            "标签列": row['标签列'],
-            "国家": row['国家'],
             "SKU": sku,
-            "FNSKU": fnsku,
+            "标签列": tag,
+            "国家": country,
             "需求数量": qty_needed,
             "订单状态": status,
-            "备注": note_str
+            "备注": "; ".join(notes),
+            "剩余外协库存": snap['外协'],
+            "剩余云仓库存": snap['云仓'],
+            "剩余深仓库存": snap['深仓'],
+            "剩余PO": snap['PO']
         }
         results.append(res_row)
         
@@ -277,6 +284,7 @@ with col_left:
         "标签列": st.column_config.SelectboxColumn("标签列", options=["新增需求", "当周需求"], required=True),
         "需求数量": st.column_config.NumberColumn("需求数量", required=True, min_value=0),
     }
+    # 这里的列顺序决定了输入框的顺序，但最终计算依赖列名
     sample = pd.DataFrame([
         {"标签列": "新增需求", "国家": "DE", "SKU": "A001", "FNSKU": "X1", "需求数量": 80},
     ])
@@ -284,27 +292,27 @@ with col_left:
 
 with col_right:
     st.subheader("2. 引用表格上传")
-    st.info("💡 请确保上传文件，系统将先扣减[提货计划]，再分配左侧需求")
+    st.info("💡 系统将严格执行：计划表预扣减 -> 需求表按优先级分配 -> 单仓深度加工逻辑")
     
-    f_inv = st.file_uploader("📂 A. 在库库存表 (含: 仓库名称, SKU, FNSKU, 可用库存)", type=['xlsx', 'xls', 'csv'])
-    f_po = st.file_uploader("📂 B. 采购订单追踪表 (含: SKU, 未入库量)", type=['xlsx', 'xls', 'csv'])
-    f_plan = st.file_uploader("📂 C. 提货需求表 (含: 国家, SKU, FNSKU, 数量)", type=['xlsx', 'xls', 'csv'])
+    f_inv = st.file_uploader("📂 A. 在库库存表", type=['xlsx', 'xls', 'csv'])
+    f_po = st.file_uploader("📂 B. 采购订单追踪表", type=['xlsx', 'xls', 'csv'])
+    f_plan = st.file_uploader("📂 C. 提货需求表", type=['xlsx', 'xls', 'csv'])
     
     st.divider()
     
     if st.button("🚀 开始运算", type="primary", use_container_width=True):
         if not (f_inv and f_po and f_plan):
-            st.error("❌ 必须上传所有3个表格才能进行逻辑运算！")
+            st.error("❌ 请上传所有3个必要文件！")
         else:
-            with st.spinner("正在执行: 提货计划预扣减 -> 优先级排序 -> 仓库策略分配..."):
+            with st.spinner("正在进行双重清洗与深度分配..."):
                 try:
-                    # 读取文件
+                    # 读取
                     df_inv_raw = load_file(f_inv, "库存表")
                     df_po_raw = load_file(f_po, "采购表")
                     df_plan_raw = load_file(f_plan, "提货计划表")
                     
                     if df_inv_raw is not None and df_po_raw is not None:
-                        # 映射标准列名
+                        # 映射
                         inv_map = {
                             smart_col(df_inv_raw, ['SKU', 'sku']): 'SKU',
                             smart_col(df_inv_raw, ['FNSKU', 'FnSKU']): 'FNSKU',
@@ -319,24 +327,24 @@ with col_right:
                         df_inv_clean = df_inv_raw.rename(columns=inv_map)
                         df_po_clean = df_po_raw.rename(columns=po_map)
                         
-                        # 初始化管理器
+                        # 初始化
                         mgr = InventoryManager(df_inv_clean, df_po_clean)
                         
-                        # 运行全流程
+                        # 运行
                         final_df = run_full_process(df_input, mgr, df_plan_raw)
                         
                         if final_df.empty:
                             st.warning("⚠️ 结果为空，请检查是否有有效的需求数量。")
                         else:
-                            st.success(f"✅ 运算完成！已处理 {len(final_df)} 条需求。")
+                            st.success(f"✅ 运算完成！")
                             st.dataframe(final_df, use_container_width=True)
                             
                             # 导出
                             buf = io.BytesIO()
                             with pd.ExcelWriter(buf, engine='xlsxwriter') as writer:
                                 final_df.to_excel(writer, index=False)
-                            st.download_button("📥 下载详细分配结果.xlsx", buf.getvalue(), "V4_Allocation_Result.xlsx", "application/vnd.ms-excel")
+                            st.download_button("📥 下载结果.xlsx", buf.getvalue(), "V5_Allocation.xlsx", "application/vnd.ms-excel")
 
                 except Exception as e:
-                    st.error(f"❌ 程序发生错误: {str(e)}")
-                    st.write("请检查上传表格的列名是否包含关键字(SKU, FNSKU, 国家, 数量等)")
+                    st.error(f"运行错误: {str(e)}")
+                    st.write("建议检查: 表头是否包含 SKU, FNSKU, 国家, 数量, 仓库, 可用库存 等关键字")
