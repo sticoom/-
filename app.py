@@ -6,7 +6,7 @@ import copy
 # ==========================================
 # 1. 基础配置
 # ==========================================
-st.set_page_config(page_title="智能调拨系统 V8.0 (全链路验证版)", layout="wide", page_icon="🦁")
+st.set_page_config(page_title="智能调拨系统 V8.1 (修复版)", layout="wide", page_icon="🦁")
 
 hide_st_style = """
     <style>
@@ -18,7 +18,7 @@ hide_st_style = """
     </style>
     """
 st.markdown(hide_st_style, unsafe_allow_html=True)
-st.title("🦁 智能库存分配 V8.0 (含原始数据验证)")
+st.title("🦁 智能库存分配 V8.1 (含原始数据验证)")
 
 # ==========================================
 # 2. 数据清洗与读取
@@ -92,7 +92,8 @@ class InventoryManager:
         self.orig_stock = {}
         self.orig_po = {}
         
-        self.stats = {'inv_rows': 0, 'po_rows': 0, 'total_stock': 0}
+        # FIX: 初始化时补上 'total_po'，防止报错
+        self.stats = {'inv_rows': 0, 'po_rows': 0, 'total_stock': 0, 'total_po': 0}
         
         self._init_inventory(df_inv)
         self._init_po(df_po)
@@ -133,6 +134,8 @@ class InventoryManager:
             q = clean_number(row.get('未入库量', 0))
             if q > 0 and s:
                 self.po[s] = self.po.get(s, 0) + q
+                # FIX: 增加 total_po 的累加逻辑
+                self.stats['total_po'] += q
 
     # --- 快照功能 ---
     def get_sku_snapshot(self, sku, use_original=False):
@@ -244,8 +247,8 @@ def smart_allocate(mgr, sku, fnsku, qty, country):
     return mgr.execute_deduction(sku, fnsku, qty, final_strategy)
 
 def run_full_process(df_demand, inv_mgr, df_plan):
-    # 0. 预计算计划表汇总 (用于输出验证)
-    plan_summary_dict = {} # sku -> total_plan_qty
+    # 0. 预计算计划表汇总
+    plan_summary_dict = {} 
     
     # 1. 计划表预扣减
     if df_plan is not None and not df_plan.empty:
@@ -263,10 +266,8 @@ def run_full_process(df_demand, inv_mgr, df_plan):
                 
                 if qty <= 0: continue
                 
-                # 记录计划汇总
                 plan_summary_dict[sku] = plan_summary_dict.get(sku, 0) + qty
                 
-                # 执行扣减
                 cty = str(row[p_country]) if p_country else "Non-US"
                 smart_allocate(inv_mgr, sku, fnsku, qty, cty)
 
@@ -304,9 +305,7 @@ def run_full_process(df_demand, inv_mgr, df_plan):
         else:
             status = f"待下单(需{qty_needed:g})"
             
-        # 获取【原始】库存快照
         orig = inv_mgr.get_sku_snapshot(sku, use_original=True)
-        # 获取【计划】汇总
         plan_total = plan_summary_dict.get(sku, 0)
         
         res_row = {
@@ -315,14 +314,14 @@ def run_full_process(df_demand, inv_mgr, df_plan):
             "国家": country, 
             "FNSKU": fnsku, 
             "需求数量": qty_needed,
-            "最终发货数量": filled, # 新增
+            "最终发货数量": filled,
             "订单状态": status, 
             "备注": "; ".join(notes),
-            "原始外协": orig['外协'], # 新增
-            "原始云仓": orig['云仓'], # 新增
-            "原始深仓": orig['深仓'], # 新增
-            "原始PO": orig['PO'],    # 新增
-            "提货计划汇总": plan_total # 新增
+            "原始外协": orig['外协'],
+            "原始云仓": orig['云仓'],
+            "原始深仓": orig['深仓'],
+            "原始PO": orig['PO'],
+            "提货计划汇总": plan_total
         }
         results.append(res_row)
         
@@ -364,7 +363,6 @@ with col_right:
                     if err1 or err2:
                         st.error(f"{err1 or ''} \n {err2 or ''}")
                     else:
-                        # 映射
                         inv_map = {
                             smart_col(df_inv_raw, ['SKU', 'sku']): 'SKU',
                             smart_col(df_inv_raw, ['FNSKU', 'FnSKU']): 'FNSKU',
@@ -379,16 +377,14 @@ with col_right:
                         df_inv_clean = df_inv_raw.rename(columns=inv_map)
                         df_po_clean = df_po_raw.rename(columns=po_map)
                         
-                        # 初始化
                         mgr = InventoryManager(df_inv_clean, df_po_clean)
                         
-                        # 数据自检
+                        # 数据自检 (Now total_po works)
                         st.success(f"📊 数据自检: 识别库存 {mgr.stats['total_stock']:,.0f} | PO {mgr.stats['total_po']:,.0f}")
                         
                         if mgr.stats['total_stock'] == 0:
                             st.warning("⚠️ 警告：未识别到库存，请检查Excel文件表头。")
                         
-                        # 运行
                         final_df = run_full_process(df_input, mgr, df_plan_raw)
                         
                         if final_df.empty:
@@ -398,7 +394,7 @@ with col_right:
                             buf = io.BytesIO()
                             with pd.ExcelWriter(buf, engine='xlsxwriter') as writer:
                                 final_df.to_excel(writer, index=False)
-                            st.download_button("📥 下载 V8 结果.xlsx", buf.getvalue(), "V8_Allocation.xlsx", "application/vnd.ms-excel")
+                            st.download_button("📥 下载 V8.1 结果.xlsx", buf.getvalue(), "V8_Allocation.xlsx", "application/vnd.ms-excel")
 
                 except Exception as e:
                     st.error(f"运行错误: {str(e)}")
