@@ -5,7 +5,7 @@ import io
 # ==========================================
 # 1. 基础配置
 # ==========================================
-st.set_page_config(page_title="智能调拨系统", layout="wide", page_icon="🧩")
+st.set_page_config(page_title="高级智能调拨系统 V3.0", layout="wide", page_icon="🧩")
 
 hide_st_style = """
     <style>
@@ -17,7 +17,7 @@ hide_st_style = """
     </style>
     """
 st.markdown(hide_st_style, unsafe_allow_html=True)
-st.title("🧩 核库存状态")
+st.title("🧩 智能库存分配 V3.0 (混合扣减策略)")
 
 # ==========================================
 # 2. 核心：库存管理器 (支持部分取货)
@@ -146,7 +146,6 @@ def load_file(file, type_tag):
         else: df = pd.read_excel(file)
         return df
     except Exception as e:
-        # 这里会捕获缺库错误并提示
         st.error(f"{type_tag} 读取失败: {e}")
         return None
 
@@ -182,6 +181,7 @@ def run_allocation_logic(df_input, inv_mgr):
         is_us = 'US' in country.upper() or '美国' in country
         
         # 定义扣减顺序 (策略链)
+        # 列表元组结构: (类型, 仓库名/PO)
         if not is_us:
             # 非US: 深仓 -> 外协 -> PO
             strategy_chain = [('stock', '深仓'), ('stock', '外协'), ('po', '采购订单')]
@@ -198,12 +198,17 @@ def run_allocation_logic(df_input, inv_mgr):
             if qty_remain <= 0: break
             
             taken = 0
+            
             if src_type == 'stock':
+                # 1. 先拿精确库存
                 t_exact = inv_mgr.take_stock_exact(sku, fnsku, src_name, qty_remain)
                 if t_exact > 0:
                     taken += t_exact
                     qty_remain -= t_exact
+                    # 记录来源
+                    # 如果同一个源既有精确又有加工，合并显示
                     
+                # 2. 如果还不够，拿替代库存(加工)
                 if qty_remain > 0:
                     t_sub, sub_details = inv_mgr.take_stock_substitute(sku, fnsku, src_name, qty_remain)
                     if t_sub > 0:
@@ -212,22 +217,26 @@ def run_allocation_logic(df_input, inv_mgr):
                         remark_list.append(f"{src_name}加工: " + ",".join(sub_details))
             
             elif src_type == 'po':
+                # 拿采购单
                 t_po = inv_mgr.take_po(sku, qty_remain)
                 if t_po > 0:
                     taken += t_po
                     qty_remain -= t_po
             
+            # 如果在这个节点拿到了货，记录下来
             if taken > 0:
                 used_sources.append(src_name)
         
         # 结果判定
         final_status = ""
         if qty_remain == 0:
-            final_status = "+".join(used_sources) 
+            final_status = "+".join(used_sources) # 例如: 外协+采购订单
         elif qty_remain < qty_needed:
+            # 部分满足
             final_status = "待下单(部分缺货)"
             remark_list.append(f"总需{qty_needed}, 缺{qty_remain}, 已配:{'+'.join(used_sources)}")
         else:
+            # 完全没货
             final_status = "待下单"
             
         res_row = row.drop('p_score').to_dict()
@@ -244,11 +253,16 @@ col_left, col_right = st.columns([35, 65])
 
 with col_left:
     st.subheader("1. 需求输入")
+    # 这里的 column_config 仅用于UI显示配置，顺序由 pd.DataFrame 定义
     col_cfg = {
         "标签列": st.column_config.SelectboxColumn("标签列", options=["新增需求", "当周需求"], required=True),
         "需求数量": st.column_config.NumberColumn("需求数量", required=True, min_value=0),
     }
+    
+    # 初始化空表，严格按用户要求顺序
     init_df = pd.DataFrame(columns=["标签列", "国家", "SKU", "FNSKU", "需求数量"])
+    
+    # 示例数据
     sample = pd.DataFrame([
         {"标签列": "新增需求", "国家": "DE", "SKU": "A001", "FNSKU": "X1", "需求数量": 80},
     ])
@@ -275,45 +289,48 @@ with col_right:
         else:
             with st.spinner("正在初始化库存池并执行混合分配..."):
                 try:
+                    # 读取与清洗
                     df_inv_raw = load_file(f_inv, "库存表")
                     df_po_raw = load_file(f_po, "采购表")
                     df_plan_raw = load_file(f_plan, "提货计划表")
                     
-                    if df_inv_raw is not None and df_po_raw is not None and df_plan_raw is not None:
-                        inv_map = {
-                            smart_col(df_inv_raw, ['SKU', 'sku']): 'SKU',
-                            smart_col(df_inv_raw, ['FNSKU', 'FnSKU']): 'FNSKU',
-                            smart_col(df_inv_raw, ['仓库', '仓库名称']): '仓库名称',
-                            smart_col(df_inv_raw, ['可用', '可用库存']): '可用库存'
-                        }
-                        po_map = {
-                            smart_col(df_po_raw, ['SKU', 'sku']): 'SKU',
-                            smart_col(df_po_raw, ['未入库', '未入库量']): '未入库量'
-                        }
-                        plan_map = {
-                            smart_col(df_plan_raw, ['SKU', 'sku']): 'SKU',
-                            smart_col(df_plan_raw, ['FNSKU', 'FnSKU']): 'FNSKU',
-                            smart_col(df_plan_raw, ['发货计划', '计划']): '发货计划'
-                        }
+                    inv_map = {
+                        smart_col(df_inv_raw, ['SKU', 'sku']): 'SKU',
+                        smart_col(df_inv_raw, ['FNSKU', 'FnSKU']): 'FNSKU',
+                        smart_col(df_inv_raw, ['仓库', '仓库名称']): '仓库名称',
+                        smart_col(df_inv_raw, ['可用', '可用库存']): '可用库存'
+                    }
+                    po_map = {
+                        smart_col(df_po_raw, ['SKU', 'sku']): 'SKU',
+                        smart_col(df_po_raw, ['未入库', '未入库量']): '未入库量'
+                    }
+                    plan_map = {
+                        smart_col(df_plan_raw, ['SKU', 'sku']): 'SKU',
+                        smart_col(df_plan_raw, ['FNSKU', 'FnSKU']): 'FNSKU',
+                        smart_col(df_plan_raw, ['发货计划', '计划']): '发货计划'
+                    }
+                    
+                    df_inv_clean = df_inv_raw.rename(columns=inv_map)
+                    df_po_clean = df_po_raw.rename(columns=po_map)
+                    df_plan_clean = df_plan_raw.rename(columns=plan_map)
+                    
+                    # 初始化与预扣减
+                    mgr = InventoryManager(df_inv_clean, df_po_clean)
+                    mgr.deduct_pre_plan(df_plan_clean)
+                    
+                    # 运行核心逻辑
+                    res = run_allocation_logic(df_input, mgr)
+                    
+                    if res.empty:
+                        st.warning("结果为空，请检查是否有有效的需求数量。")
+                    else:
+                        st.success("✅ 运算完成！")
+                        st.dataframe(res, use_container_width=True)
                         
-                        df_inv_clean = df_inv_raw.rename(columns=inv_map)
-                        df_po_clean = df_po_raw.rename(columns=po_map)
-                        df_plan_clean = df_plan_raw.rename(columns=plan_map)
+                        buf = io.BytesIO()
+                        with pd.ExcelWriter(buf, engine='xlsxwriter') as writer:
+                            res.to_excel(writer, index=False)
+                        st.download_button("📥 下载结果.xlsx", buf.getvalue(), "智能分配结果_V3.xlsx", "application/vnd.ms-excel")
                         
-                        mgr = InventoryManager(df_inv_clean, df_po_clean)
-                        mgr.deduct_pre_plan(df_plan_clean)
-                        
-                        res = run_allocation_logic(df_input, mgr)
-                        
-                        if res.empty:
-                            st.warning("结果为空，请检查是否有有效的需求数量。")
-                        else:
-                            st.success("✅ 运算完成！")
-                            st.dataframe(res, use_container_width=True)
-                            
-                            buf = io.BytesIO()
-                            with pd.ExcelWriter(buf, engine='xlsxwriter') as writer:
-                                res.to_excel(writer, index=False)
-                            st.download_button("📥 下载结果.xlsx", buf.getvalue(), "智能分配结果_V3.xlsx", "application/vnd.ms-excel")
                 except Exception as e:
                     st.error(f"运行错误: {str(e)}")
