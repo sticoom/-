@@ -478,4 +478,3 @@ with col_right:
 
                 except Exception as e:
                     st.error(f"运行错误: {str(e)}")
-                    
