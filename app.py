@@ -6,7 +6,7 @@ import copy
 # ==========================================
 # 1. 基础配置
 # ==========================================
-st.set_page_config(page_title="智能调拨系统 V11.0 (精简输入版)", layout="wide", page_icon="🦁")
+st.set_page_config(page_title="智能调拨系统 V11.1 (修复版)", layout="wide", page_icon="🦁")
 
 hide_st_style = """
     <style>
@@ -18,7 +18,7 @@ hide_st_style = """
     </style>
     """
 st.markdown(hide_st_style, unsafe_allow_html=True)
-st.title("🦁 智能库存分配 V11.0 (含验证表+选填列)")
+st.title("🦁 智能库存分配 V11.1 (最终稳定版)")
 
 # ==========================================
 # 2. 数据清洗与读取
@@ -31,10 +31,11 @@ def clean_number(x):
     except: return 0
 
 def load_and_find_header(file, type_tag):
-    """自动寻找表头"""
+    """自动寻找表头 (鲁棒性读取)"""
     if not file: return None, "未上传"
     try:
         file.seek(0)
+        # 预览前15行
         if file.name.endswith('.csv'):
             try: df_preview = pd.read_csv(file, header=None, nrows=15, encoding='utf-8-sig')
             except: 
@@ -43,6 +44,7 @@ def load_and_find_header(file, type_tag):
         else:
             df_preview = pd.read_excel(file, header=None, nrows=15)
         
+        # 寻找包含 SKU 的行
         header_idx = -1
         for i, row in df_preview.iterrows():
             row_str = " ".join([str(v).upper() for v in row.values])
@@ -52,6 +54,7 @@ def load_and_find_header(file, type_tag):
         
         if header_idx == -1: return None, f"❌ {type_tag}: 未找到包含'SKU'的表头行"
         
+        # 重新读取
         file.seek(0)
         if file.name.endswith('.csv'):
             try: df = pd.read_csv(file, header=header_idx, encoding='utf-8-sig')
@@ -89,6 +92,7 @@ class InventoryManager:
         self.orig_stock = {}
         self.orig_po = {}
         
+        # 统计数据初始化 (修复 total_po 报错)
         self.stats = {
             'inv_rows': 0, 'po_rows': 0, 
             'total_stock': 0, 'total_po': 0,
@@ -116,7 +120,7 @@ class InventoryManager:
             f = str(f_raw).strip() if pd.notna(f_raw) else ""
             w_name = str(row.get('仓库名称', ''))
             
-            # === 功能2: 库存过滤 (沃尔玛/TEMU) ===
+            # === 库存过滤 (沃尔玛/TEMU) ===
             if "沃尔玛" in w_name or "TEMU" in w_name.upper():
                 self.stats['filtered_inv'] += 1
                 continue
@@ -136,7 +140,7 @@ class InventoryManager:
         self.stats['po_rows'] = len(df)
         col_req = smart_col(df, ['需求人', '申请人', 'Requester', '业务员'])
         
-        # === 功能3: PO过滤黑名单 ===
+        # === PO过滤黑名单 ===
         block_list = ["陈丹丹", "张萍", "杨上儒", "陈炜填", "贝少婷", "詹翠萍"]
         
         for _, row in df.iterrows():
@@ -151,7 +155,7 @@ class InventoryManager:
             q = clean_number(row.get('未入库量', 0))
             if q > 0 and s:
                 self.po[s] = self.po.get(s, 0) + q
-                self.stats['total_po'] += q
+                self.stats['total_po'] += q # 确保这里累加
 
     def get_sku_snapshot(self, sku, use_original=False):
         res = {'外协': 0, '云仓': 0, '深仓': 0, 'PO': 0}
@@ -306,7 +310,6 @@ def run_full_process(df_demand, inv_mgr, df_plan):
     
     results = []
     
-    # === 功能4: 计算过程验证表数据 ===
     verify_data = {} 
 
     for idx, row in df_sorted.iterrows():
@@ -330,7 +333,6 @@ def run_full_process(df_demand, inv_mgr, df_plan):
         orig = inv_mgr.get_sku_snapshot(sku, use_original=True)
         plan_total = plan_summary_dict.get(sku, 0)
         
-        # 收集验证数据
         if sku not in verify_data:
             orig_total = sum(orig.values())
             verify_data[sku] = {
@@ -355,7 +357,6 @@ def run_full_process(df_demand, inv_mgr, df_plan):
         })
         results.append(res_row)
 
-    # 生成验证表 DataFrame
     verify_rows = []
     for sku, data in verify_data.items():
         net_avail = data["初始总库存(含PO)"] - data["提货计划占用"]
@@ -368,7 +369,7 @@ def run_full_process(df_demand, inv_mgr, df_plan):
             "4.本次需求总计": data["本次需求总计"],
             "5.实际分配总计": data["实际分配总计"],
             "6.缺口(4-5)": gap,
-            "状态": "✅ 平衡" if gap <= 0 else "⚠️ 缺货"
+            "状态": "✅ 平衡" if gap <= 0.001 else "⚠️ 缺货"
         })
         
     return pd.DataFrame(results), pd.DataFrame(verify_rows)
@@ -381,13 +382,11 @@ col_left, col_right = st.columns([35, 65])
 with col_left:
     st.subheader("1. 需求输入")
     
-    # === 修改：删除Excel粘贴，仅保留 手动录入 和 文件上传 ===
     tab1, tab2 = st.tabs(["手动录入", "文件上传"])
     
     df_input = None
     
     with tab1:
-        # 增加了两个选填列
         col_cfg = {
             "标签列": st.column_config.SelectboxColumn("标签列", options=["新增需求", "当周需求"], required=True),
             "需求数量": st.column_config.NumberColumn("需求数量", required=True, min_value=0),
@@ -456,17 +455,17 @@ with col_right:
                         c1, c2, c3 = st.columns(3)
                         c1.metric("有效库存", f"{mgr.stats['total_stock']:,.0f}")
                         c2.metric("有效PO", f"{mgr.stats['total_po']:,.0f}")
-                        c3.metric("🚫 已过滤行数", f"库:{mgr.stats['filtered_inv']} | PO:{mgr.stats['filtered_po']}")
+                        c3.metric("🚫 已过滤", f"库:{mgr.stats['filtered_inv']} | PO:{mgr.stats['filtered_po']}")
                         
                         if mgr.stats['total_stock'] == 0:
-                            st.warning("⚠️ 警告：有效库存为0")
+                            st.warning("⚠️ 警告：有效库存为0 (可能全被过滤或读取失败)")
                         
                         final_df, verify_df = run_full_process(df_input, mgr, df_plan_raw)
                         
                         if final_df.empty:
                             st.warning("无有效结果")
                         else:
-                            with st.expander("🧮 点击查看【计算过程验证表】(Check Calculation)", expanded=False):
+                            with st.expander("🧮 点击查看【计算过程验证表】", expanded=False):
                                 st.dataframe(verify_df, use_container_width=True)
                             
                             st.dataframe(final_df, use_container_width=True)
@@ -475,7 +474,7 @@ with col_right:
                             with pd.ExcelWriter(buf, engine='xlsxwriter') as writer:
                                 final_df.to_excel(writer, sheet_name='分配结果', index=False)
                                 verify_df.to_excel(writer, sheet_name='过程验证', index=False)
-                            st.download_button("📥 下载 V11 结果.xlsx", buf.getvalue(), "V11_Allocation.xlsx", "application/vnd.ms-excel")
+                            st.download_button("📥 下载 V11.1 结果.xlsx", buf.getvalue(), "V11_Allocation.xlsx", "application/vnd.ms-excel")
 
                 except Exception as e:
                     st.error(f"运行错误: {str(e)}")
