@@ -6,7 +6,7 @@ import copy
 # ==========================================
 # 1. 基础配置
 # ==========================================
-st.set_page_config(page_title="智能调拨系统 V11.1 (修复版)", layout="wide", page_icon="🦁")
+st.set_page_config(page_title="智能调拨系统 V11.1 (最终修复版)", layout="wide", page_icon="🦁")
 
 hide_st_style = """
     <style>
@@ -18,7 +18,7 @@ hide_st_style = """
     </style>
     """
 st.markdown(hide_st_style, unsafe_allow_html=True)
-st.title("🦁 智能库存分配 V11.1 (最终稳定版)")
+st.title("🦁 智能库存分配 V11.1 (稳定版+验证表)")
 
 # ==========================================
 # 2. 数据清洗与读取
@@ -92,7 +92,7 @@ class InventoryManager:
         self.orig_stock = {}
         self.orig_po = {}
         
-        # 统计数据初始化 (修复 total_po 报错)
+        # 统计数据初始化
         self.stats = {
             'inv_rows': 0, 'po_rows': 0, 
             'total_stock': 0, 'total_po': 0,
@@ -155,7 +155,7 @@ class InventoryManager:
             q = clean_number(row.get('未入库量', 0))
             if q > 0 and s:
                 self.po[s] = self.po.get(s, 0) + q
-                self.stats['total_po'] += q # 确保这里累加
+                self.stats['total_po'] += q
 
     def get_sku_snapshot(self, sku, use_original=False):
         res = {'外协': 0, '云仓': 0, '深仓': 0, 'PO': 0}
@@ -478,3 +478,4 @@ with col_right:
 
                 except Exception as e:
                     st.error(f"运行错误: {str(e)}")
+                    
