@@ -6,7 +6,7 @@ import copy
 # ==========================================
 # 1. 基础配置
 # ==========================================
-st.set_page_config(page_title="智能调拨系统 V9.0 (灵活输入版)", layout="wide", page_icon="🦁")
+st.set_page_config(page_title="智能调拨系统 V10.0 (黑名单过滤+过程验证)", layout="wide", page_icon="🦁")
 
 hide_st_style = """
     <style>
@@ -18,7 +18,7 @@ hide_st_style = """
     </style>
     """
 st.markdown(hide_st_style, unsafe_allow_html=True)
-st.title("🦁 智能库存分配 V9.0 (保留任意列+计划选填)")
+st.title("🦁 智能库存分配 V10.0 (自动过滤 & 过程验证)")
 
 # ==========================================
 # 2. 数据清洗与读取
@@ -31,11 +31,10 @@ def clean_number(x):
     except: return 0
 
 def load_and_find_header(file, type_tag):
-    """自动寻找表头 (鲁棒性读取)"""
+    """自动寻找表头"""
     if not file: return None, "未上传"
     try:
         file.seek(0)
-        # 预览前15行
         if file.name.endswith('.csv'):
             try: df_preview = pd.read_csv(file, header=None, nrows=15, encoding='utf-8-sig')
             except: 
@@ -44,7 +43,6 @@ def load_and_find_header(file, type_tag):
         else:
             df_preview = pd.read_excel(file, header=None, nrows=15)
         
-        # 寻找包含 SKU 的行
         header_idx = -1
         for i, row in df_preview.iterrows():
             row_str = " ".join([str(v).upper() for v in row.values])
@@ -54,7 +52,6 @@ def load_and_find_header(file, type_tag):
         
         if header_idx == -1: return None, f"❌ {type_tag}: 未找到包含'SKU'的表头行"
         
-        # 重新读取
         file.seek(0)
         if file.name.endswith('.csv'):
             try: df = pd.read_csv(file, header=header_idx, encoding='utf-8-sig')
@@ -84,20 +81,23 @@ def smart_col(df, candidates):
 # ==========================================
 class InventoryManager:
     def __init__(self, df_inv, df_po):
-        # 动态库存 (随分配减少)
+        # 动态库存
         self.stock = {} 
         self.po = {}
         
-        # 原始库存 (只读备份，用于验证展示)
+        # 原始库存 (备份)
         self.orig_stock = {}
         self.orig_po = {}
         
-        self.stats = {'inv_rows': 0, 'po_rows': 0, 'total_stock': 0, 'total_po': 0}
+        self.stats = {
+            'inv_rows': 0, 'po_rows': 0, 
+            'total_stock': 0, 'total_po': 0,
+            'filtered_inv': 0, 'filtered_po': 0 # 记录过滤数量
+        }
         
         self._init_inventory(df_inv)
         self._init_po(df_po)
         
-        # 创建原始数据备份
         self.orig_stock = copy.deepcopy(self.stock)
         self.orig_po = copy.deepcopy(self.po)
 
@@ -115,6 +115,12 @@ class InventoryManager:
             f_raw = row.get('FNSKU', '')
             f = str(f_raw).strip() if pd.notna(f_raw) else ""
             w_name = str(row.get('仓库名称', ''))
+            
+            # === 功能2: 库存过滤 (沃尔玛/TEMU) ===
+            if "沃尔玛" in w_name or "TEMU" in w_name.upper():
+                self.stats['filtered_inv'] += 1
+                continue
+            
             q = clean_number(row.get('可用库存', 0))
             
             if q <= 0 or not s: continue
@@ -128,16 +134,30 @@ class InventoryManager:
 
     def _init_po(self, df):
         self.stats['po_rows'] = len(df)
+        
+        # 识别需求人列
+        col_req = smart_col(df, ['需求人', '申请人', 'Requester', '业务员'])
+        
+        # === 功能3: PO过滤黑名单 ===
+        block_list = ["陈丹丹", "张萍", "杨上儒", "陈炜填", "贝少婷", "詹翠萍"]
+        
         for _, row in df.iterrows():
             s = str(row.get('SKU', '')).strip()
+            
+            # 检查黑名单
+            if col_req:
+                requester = str(row.get(col_req, ''))
+                # 只要名字出现在字段中，就过滤 (模糊匹配)
+                if any(name in requester for name in block_list):
+                    self.stats['filtered_po'] += 1
+                    continue
+
             q = clean_number(row.get('未入库量', 0))
             if q > 0 and s:
                 self.po[s] = self.po.get(s, 0) + q
                 self.stats['total_po'] += q
 
-    # --- 快照功能 ---
     def get_sku_snapshot(self, sku, use_original=False):
-        """获取某SKU各维度库存"""
         res = {'外协': 0, '云仓': 0, '深仓': 0, 'PO': 0}
         target_stock = self.orig_stock if use_original else self.stock
         target_po = self.orig_po if use_original else self.po
@@ -149,7 +169,6 @@ class InventoryManager:
         res['PO'] = target_po.get(sku, 0)
         return res
 
-    # --- 巡检 ---
     def check_max_availability(self, sku, target_fnsku, src_type, src_name):
         total_avail = 0
         if src_type == 'stock':
@@ -164,7 +183,6 @@ class InventoryManager:
                 total_avail += self.po[sku]
         return total_avail
 
-    # --- 执行 ---
     def execute_deduction(self, sku, target_fnsku, qty_needed, strategy_chain):
         qty_remain = qty_needed
         breakdown_notes = []
@@ -244,10 +262,9 @@ def smart_allocate(mgr, sku, fnsku, qty, country):
     return mgr.execute_deduction(sku, fnsku, qty, final_strategy)
 
 def run_full_process(df_demand, inv_mgr, df_plan):
-    # 0. 预计算计划表汇总
     plan_summary_dict = {} 
     
-    # 1. 计划表预扣减 (如果没上传 df_plan，这一步自动跳过)
+    # 1. 计划表预扣减
     if df_plan is not None and not df_plan.empty:
         p_sku = smart_col(df_plan, ['SKU', 'sku'])
         p_fnsku = smart_col(df_plan, ['FNSKU', 'FnSKU'])
@@ -262,26 +279,21 @@ def run_full_process(df_demand, inv_mgr, df_plan):
                 qty = clean_number(row[p_qty])
                 
                 if qty <= 0: continue
-                
                 plan_summary_dict[sku] = plan_summary_dict.get(sku, 0) + qty
                 
                 cty = str(row[p_country]) if p_country else "Non-US"
                 smart_allocate(inv_mgr, sku, fnsku, qty, cty)
 
-    # 2. 需求分配 (处理输入数据)
+    # 2. 需求分配
     df = df_demand.copy()
-    
-    # 识别核心列
     col_sku = smart_col(df, ['SKU', 'sku'])
-    col_qty = smart_col(df, ['需求数量', '数量', 'Qty', '需求'])
-    col_tag = smart_col(df, ['标签列', '标签', 'Tag'])
+    col_qty = smart_col(df, ['需求数量', '数量', 'Qty'])
+    col_tag = smart_col(df, ['标签列', '标签'])
     col_country = smart_col(df, ['国家', 'Country'])
-    col_fnsku = smart_col(df, ['FNSKU', 'FnSKU', 'fnsku'])
+    col_fnsku = smart_col(df, ['FNSKU', 'FnSKU'])
     
-    # 如果找不到列，返回错误
     if not (col_sku and col_qty and col_tag and col_country):
-        st.error(f"❌ 需求表缺少关键列，请检查表头。需包含: SKU, 数量, 标签, 国家")
-        return pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame() # Return empty if cols missing
 
     df['calc_qty'] = df[col_qty].apply(clean_number)
     df = df[df['calc_qty'] > 0]
@@ -294,19 +306,20 @@ def run_full_process(df_demand, inv_mgr, df_plan):
         return base_score + country_offset
 
     df['sort_key'] = df.apply(get_sort_key, axis=1)
-    # 按 SKU 聚类，再按优先级
     df_sorted = df.sort_values(by=[col_sku, 'sort_key', col_country])
     
     results = []
+    
+    # === 功能4: 计算过程验证表数据 ===
+    verify_data = {} # SKU -> {orig, plan, demand_total, allocated_total}
+
     for idx, row in df_sorted.iterrows():
-        # 提取数据
         sku = str(row[col_sku]).strip()
         f_raw = row.get(col_fnsku, '')
         fnsku = str(f_raw).strip() if pd.notna(f_raw) else ""
         country = str(row[col_country]).strip()
         qty_needed = row['calc_qty']
         
-        # 执行分配
         filled, notes, sources = smart_allocate(inv_mgr, sku, fnsku, qty_needed, country)
         
         status = ""
@@ -321,29 +334,48 @@ def run_full_process(df_demand, inv_mgr, df_plan):
         orig = inv_mgr.get_sku_snapshot(sku, use_original=True)
         plan_total = plan_summary_dict.get(sku, 0)
         
-        # === 关键修改：保留用户的所有原始列，并追加新列 ===
-        res_row = row.to_dict()
+        # 收集验证数据
+        if sku not in verify_data:
+            orig_total = sum(orig.values())
+            verify_data[sku] = {
+                "初始总库存(含PO)": orig_total,
+                "提货计划占用": plan_total,
+                "本次需求总计": 0,
+                "实际分配总计": 0
+            }
+        verify_data[sku]["本次需求总计"] += qty_needed
+        verify_data[sku]["实际分配总计"] += filled
         
-        # 移除临时计算列
+        res_row = row.to_dict()
         if 'sort_key' in res_row: del res_row['sort_key']
         if 'calc_qty' in res_row: del res_row['calc_qty']
         
-        # 追加计算结果
         res_row.update({
-            "SKU": sku, # 确保核心列在
-            "FNSKU": fnsku,
-            "最终发货数量": filled,
-            "订单状态": status, 
-            "备注": "; ".join(notes),
-            "原始外协": orig['外协'],
-            "原始云仓": orig['云仓'],
-            "原始深仓": orig['深仓'],
-            "原始PO": orig['PO'],
+            "SKU": sku, "FNSKU": fnsku, "最终发货数量": filled,
+            "订单状态": status, "备注": "; ".join(notes),
+            "原始外协": orig['外协'], "原始云仓": orig['云仓'],
+            "原始深仓": orig['深仓'], "原始PO": orig['PO'],
             "提货计划汇总": plan_total
         })
         results.append(res_row)
+
+    # 生成验证表 DataFrame
+    verify_rows = []
+    for sku, data in verify_data.items():
+        net_avail = data["初始总库存(含PO)"] - data["提货计划占用"]
+        gap = data["本次需求总计"] - data["实际分配总计"]
+        verify_rows.append({
+            "SKU": sku,
+            "1.初始总库存": data["初始总库存(含PO)"],
+            "2.提货计划占用": data["提货计划占用"],
+            "3.净可用库存(1-2)": net_avail,
+            "4.本次需求总计": data["本次需求总计"],
+            "5.实际分配总计": data["实际分配总计"],
+            "6.缺口(4-5)": gap,
+            "状态": "✅ 平衡" if gap <= 0 else "⚠️ 缺货"
+        })
         
-    return pd.DataFrame(results)
+    return pd.DataFrame(results), pd.DataFrame(verify_rows)
 
 # ==========================================
 # 5. UI 界面
@@ -352,52 +384,55 @@ col_left, col_right = st.columns([35, 65])
 
 with col_left:
     st.subheader("1. 需求输入")
-    
-    # === 新增功能：输入方式选择 ===
-    input_method = st.radio("选择输入方式:", ["手动录入 (基础列)", "文件上传 (保留任意列)"], horizontal=True)
+    # === 功能1: 灵活录入 (支持粘贴) ===
+    tab1, tab2, tab3 = st.tabs(["手动录入", "文件上传", "Excel粘贴(推荐)"])
     
     df_input = None
     
-    if input_method == "手动录入 (基础列)":
+    with tab1:
         col_cfg = {
             "标签列": st.column_config.SelectboxColumn("标签列", options=["新增需求", "当周需求"], required=True),
             "需求数量": st.column_config.NumberColumn("需求数量", required=True, min_value=0),
         }
         sample = pd.DataFrame([{"标签列": "新增需求", "国家": "DE", "SKU": "A001", "FNSKU": "X1", "需求数量": 80}])
-        df_input = st.data_editor(sample, column_config=col_cfg, num_rows="dynamic", height=450, use_container_width=True)
-    else:
-        # 文件上传模式
-        up_file = st.file_uploader("📤 上传需求表格 (支持自定义列)", type=['xlsx', 'xls', 'csv'])
+        df_manual = st.data_editor(sample, column_config=col_cfg, num_rows="dynamic", use_container_width=True)
+        if not df_manual.empty: df_input = df_manual
+        
+    with tab2:
+        up_file = st.file_uploader("📤 上传需求表格", type=['xlsx', 'xls', 'csv'])
         if up_file:
             df_input, _ = load_and_find_header(up_file, "需求表")
-            if df_input is not None:
-                st.success(f"已加载 {len(df_input)} 行数据，包含列: {list(df_input.columns)}")
-                st.dataframe(df_input.head(3), use_container_width=True, height=150)
+            
+    with tab3:
+        paste_txt = st.text_area("📋 请在此处粘贴 Excel 内容 (含表头):", height=200, help="直接从Excel复制所有列粘贴到这里")
+        if paste_txt:
+            try:
+                df_input = pd.read_csv(io.StringIO(paste_txt), sep='\t')
+                st.success(f"已识别 {len(df_input)} 行数据")
+            except:
+                st.error("格式识别失败，请确保是从Excel直接复制的")
 
 with col_right:
     st.subheader("2. 库存文件上传")
-    st.info("💡 提货计划为【选填】，如有上传则优先扣减。")
+    st.info("💡 提货计划为【选填】")
     
     f_inv = st.file_uploader("📂 A. 在库库存表 (必填)", type=['xlsx', 'xls', 'csv'])
     f_po = st.file_uploader("📂 B. 采购订单追踪表 (必填)", type=['xlsx', 'xls', 'csv'])
-    # === 修改说明：明确标记为选填 ===
-    f_plan = st.file_uploader("📂 C. 提货需求表 (选填 - 用于预扣减)", type=['xlsx', 'xls', 'csv'])
+    f_plan = st.file_uploader("📂 C. 提货需求表 (选填)", type=['xlsx', 'xls', 'csv'])
     
     st.divider()
     
     if st.button("🚀 开始运算", type="primary", use_container_width=True):
-        # === 修改说明：f_plan 不再强制 ===
         if not (f_inv and f_po):
             st.error("❌ 请至少上传【库存表】和【采购表】！")
         elif df_input is None or df_input.empty:
-            st.error("❌ 请输入或上传需求数据！")
+            st.error("❌ 请输入需求数据！")
         else:
-            with st.spinner("正在读取并进行全链路计算..."):
+            with st.spinner("执行黑名单过滤与双轨分配..."):
                 try:
                     df_inv_raw, err1 = load_and_find_header(f_inv, "库存表")
                     df_po_raw, err2 = load_and_find_header(f_po, "采购表")
                     
-                    # 提货计划是选填的
                     df_plan_raw = None
                     if f_plan:
                         df_plan_raw, err3 = load_and_find_header(f_plan, "计划表")
@@ -421,23 +456,33 @@ with col_right:
                         
                         mgr = InventoryManager(df_inv_clean, df_po_clean)
                         
-                        # 数据自检
-                        st.success(f"📊 数据自检: 识别库存 {mgr.stats['total_stock']:,.0f} | PO {mgr.stats['total_po']:,.0f}")
+                        # 看板：显示过滤情况
+                        c1, c2, c3 = st.columns(3)
+                        c1.metric("有效库存", f"{mgr.stats['total_stock']:,.0f}")
+                        c2.metric("有效PO", f"{mgr.stats['total_po']:,.0f}")
+                        c3.metric("🚫 已过滤行数", f"库:{mgr.stats['filtered_inv']} | PO:{mgr.stats['filtered_po']}")
                         
                         if mgr.stats['total_stock'] == 0:
-                            st.warning("⚠️ 警告：未识别到库存，请检查Excel文件表头。")
+                            st.warning("⚠️ 警告：有效库存为0 (可能全被过滤或读取失败)")
                         
-                        # 运行计算
-                        final_df = run_full_process(df_input, mgr, df_plan_raw)
+                        final_df, verify_df = run_full_process(df_input, mgr, df_plan_raw)
                         
                         if final_df.empty:
-                            st.warning("无有效结果 (可能是SKU未匹配或数量为0)")
+                            st.warning("无有效结果")
                         else:
+                            # 1. 验证表 (折叠显示)
+                            with st.expander("🧮 点击查看【计算过程验证表】(Check Calculation)", expanded=False):
+                                st.dataframe(verify_df, use_container_width=True)
+                            
+                            # 2. 结果表
                             st.dataframe(final_df, use_container_width=True)
+                            
+                            # 导出
                             buf = io.BytesIO()
                             with pd.ExcelWriter(buf, engine='xlsxwriter') as writer:
-                                final_df.to_excel(writer, index=False)
-                            st.download_button("📥 下载 V9.0 结果.xlsx", buf.getvalue(), "V9_Allocation.xlsx", "application/vnd.ms-excel")
+                                final_df.to_excel(writer, sheet_name='分配结果', index=False)
+                                verify_df.to_excel(writer, sheet_name='过程验证', index=False)
+                            st.download_button("📥 下载 V10 结果.xlsx", buf.getvalue(), "V10_Allocation.xlsx", "application/vnd.ms-excel")
 
                 except Exception as e:
                     st.error(f"运行错误: {str(e)}")
