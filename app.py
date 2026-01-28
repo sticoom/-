@@ -7,7 +7,7 @@ import re
 # ==========================================
 # 1. 基础配置
 # ==========================================
-st.set_page_config(page_title="智能调拨系统 V18.0 (模糊匹配优化版)", layout="wide", page_icon="🦁")
+st.set_page_config(page_title="智能调拨系统 V19.0 (自动优先级版)", layout="wide", page_icon="🦁")
 
 hide_st_style = """
     <style>
@@ -19,7 +19,7 @@ hide_st_style = """
     </style>
     """
 st.markdown(hide_st_style, unsafe_allow_html=True)
-st.title("🦁 智能库存分配 V18.0 (模糊匹配优化版)")
+st.title("🦁 智能库存分配 V19.0 (W3优先W4-自动排序)")
 
 # ==========================================
 # 2. 数据清洗与辅助函数
@@ -229,7 +229,6 @@ class InventoryManager:
         """
         for src_type, src_name in candidates:
             total_avail = 0
-            # 简单计算该仓库所有FNSKU的总库存
             if src_type == 'stock' and sku in self.stock:
                 for f in self.stock[sku]:
                     total_avail += self.stock[sku][f].get(src_name, 0)
@@ -262,18 +261,15 @@ def get_strategy(inv_mgr, sku, target_fnsku, qty, country, preferred_status=None
         # 使用 fuzzy matching 标准化用户输入
         std_status = normalize_wh_name(preferred_status)
         if std_status != "其他":
-            # 找到对应的 tuple 并置顶
             target = next((x for x in base_pool if x[1] == std_status), None)
             if target:
                 final_strategy.append(target)
                 base_pool = [x for x in base_pool if x != target]
     
-    # 2. US 整仓优先策略 (仅针对无指定状态的情况 或 剩余部分)
+    # 2. US 整仓优先策略
     if is_us:
-        # 尝试寻找最佳单一仓库
         best_single = inv_mgr.find_best_single_warehouse(sku, target_fnsku, qty, base_pool)
         if best_single:
-            # 如果找到能全满足的，且它不在首位，把它挪到最前
             if best_single in base_pool:
                 base_pool.remove(best_single)
                 base_pool.insert(0, best_single)
@@ -304,7 +300,7 @@ def run_allocation(df_input, inv_mgr, df_plan):
         sku = str(row['SKU']).strip()
         fnsku = str(row.get('FNSKU', '')).strip()
         country = str(row['国家']).strip()
-        # 标签列已移除，直接通过数值列判断
+        # [修改点] 移除标签列的读取，完全依赖数值列判断优先级
         
         # 数量读取
         w3_orig = clean_number(row.get('第三周发货原始数量', 0))
@@ -314,15 +310,15 @@ def run_allocation(df_input, inv_mgr, df_plan):
         
         is_us = 'US' in country.upper()
         
-        # Task A: W3 Base (Tier 0)
+        # Task A: W3 Base (Tier 0) - 最高优先
         if w3_orig > 0:
             tasks.append({
                 'row_idx': idx, 'type': 'w3_base', 'priority': 0,
                 'sku': sku, 'fnsku': fnsku, 'country': country, 'qty': w3_orig,
-                'pref_status': w3_status # 传递原始状态
+                'pref_status': w3_status 
             })
             
-        # Task B: W3 Incr (Tier 1/2)
+        # Task B: W3 Incr (Tier 1/2) - 次优先
         incr = w3_final - w3_orig
         if incr > 0:
             p = 2 if is_us else 1
@@ -332,7 +328,7 @@ def run_allocation(df_input, inv_mgr, df_plan):
                 'pref_status': None
             })
             
-        # Task C: W4 Week (Tier 3/4)
+        # Task C: W4 Week (Tier 3/4) - 最后分配
         if w4_qty > 0:
             p = 4 if is_us else 3
             tasks.append({
@@ -342,6 +338,7 @@ def run_allocation(df_input, inv_mgr, df_plan):
             })
 
     # --- 3. 执行分配 ---
+    # 排序保证：W3 Base(0) -> Non-US Incr(1) -> US Incr(2) -> Non-US W4(3) -> US W4(4)
     tasks.sort(key=lambda x: x['priority'])
     
     results = {} 
@@ -399,14 +396,11 @@ def run_allocation(df_input, inv_mgr, df_plan):
         
         # 增量来源分析
         orig_stat = str(row.get('第三周发货原始状态', ''))
-        # 使用标准化后的名称进行对比
         norm_orig_stat = normalize_wh_name(orig_stat)
         
         w3_compare_str = f"[原:{orig_stat}]"
         diff_src = []
         for s in res['w3_src']:
-             # 只有当实际来源 标准化后 != 原始状态 标准化后，才算增量差异
-             # 例如: 原始"深圳仓库存"(深仓) vs 实际"深仓"(深仓) -> 相等，不显示
              if normalize_wh_name(s) != norm_orig_stat:
                  diff_src.append(s)
                  
@@ -496,6 +490,7 @@ with col_main:
     st.subheader("1. 需求填报 (在线编辑)")
     st.info("💡 请直接在下方表格输入数据，右键可增加行/删除行")
     
+    # [修改点] 移除标签列配置，国家列改为自由文本
     col_config = {
         "国家": st.column_config.TextColumn("国家", required=True),
         "SKU": st.column_config.TextColumn("SKU", required=True),
@@ -548,6 +543,6 @@ with col_side:
                         final_df.to_excel(writer, sheet_name='结果', index=False)
                         writer.sheets['结果'].freeze_panes(1, 0)
                     
-                    st.download_button("📥 下载结果.xlsx", buf.getvalue(), "V18_Result.xlsx")
+                    st.download_button("📥 下载结果.xlsx", buf.getvalue(), "V19_Result.xlsx")
         else:
             st.warning("请完善需求表并上传库存文件")
