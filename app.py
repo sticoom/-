@@ -6,7 +6,7 @@ import copy
 # ==========================================
 # 1. 基础配置
 # ==========================================
-st.set_page_config(page_title="智能调拨系统 V22.0 (严谨验证版)", layout="wide", page_icon="🦁")
+st.set_page_config(page_title="智能调拨系统 V22.1 (精准列锁定版)", layout="wide", page_icon="🦁")
 
 hide_st_style = """
     <style>
@@ -18,7 +18,7 @@ hide_st_style = """
     </style>
     """
 st.markdown(hide_st_style, unsafe_allow_html=True)
-st.title("🦁 智能库存分配 V22.0 (US整单严格 + 全过程监控)")
+st.title("🦁 智能库存分配 V22.1 (锁定可用库存 & 未入库量)")
 
 # ==========================================
 # 2. 数据清洗与辅助函数
@@ -80,13 +80,12 @@ def load_and_find_header(file, type_tag):
         return None, f"读取错误: {str(e)}"
 
 # ==========================================
-# 3. 核心：库存管理器 (含日志)
+# 3. 核心：库存管理器 (含列锁定逻辑)
 # ==========================================
 class InventoryManager:
     def __init__(self, df_inv, df_po):
         self.stock = {} 
         self.po = {}
-        # 日志容器
         self.cleaning_logs = []
         
         self._init_inventory(df_inv)
@@ -100,16 +99,24 @@ class InventoryManager:
         c_sku = next((c for c in df.columns if 'SKU' in c.upper()), None)
         c_fnsku = next((c for c in df.columns if 'FNSKU' in c.upper()), None)
         c_wh = next((c for c in df.columns if '仓库' in c), None)
-        c_qty = next((c for c in df.columns if '数量' in c or '库存' in c), None)
+        
+        # === 修正点：优先锁定“可用” ===
+        # 优先级 1: 包含 "可用" 的列 (如 "可用库存", "可用数量")
+        c_qty = next((c for c in df.columns if '可用' in c), None)
+        # 优先级 2: 如果没找到可用，才找通用词 "数量" 或 "库存"
+        if not c_qty:
+            c_qty = next((c for c in df.columns if '数量' in c or '库存' in c), None)
 
-        if not (c_sku and c_wh and c_qty): return
+        if not (c_sku and c_wh and c_qty): 
+            self.cleaning_logs.append({"类型": "系统错误", "SKU": "-", "原因": "库存表缺少必要列(SKU/仓库/可用库存)"})
+            return
 
         for idx, row in df.iterrows():
             w_name_raw = str(row.get(c_wh, ''))
             w_name_norm = normalize_str(w_name_raw)
             sku = str(row.get(c_sku, '')).strip()
             
-            # === 清洗日志：黑名单 ===
+            # 黑名单
             blacklist_keywords = ["沃尔玛", "WALMART", "TEMU"]
             if any(k in w_name_norm for k in blacklist_keywords):
                 self.cleaning_logs.append({
@@ -136,7 +143,14 @@ class InventoryManager:
         if df is None or df.empty: return
         
         c_sku = next((c for c in df.columns if 'SKU' in c.upper()), None)
-        c_qty = next((c for c in df.columns if '未入库' in c or '数量' in c), None)
+        
+        # === 修正点：优先锁定“未入库” ===
+        # 优先级 1: 包含 "未入库" 的列
+        c_qty = next((c for c in df.columns if '未入库' in c), None)
+        # 优先级 2: 包含 "数量" 的列 (作为兜底，但有风险)
+        if not c_qty:
+            c_qty = next((c for c in df.columns if '数量' in c), None)
+            
         c_req = next((c for c in df.columns if '人' in c or '员' in c), None)
         
         block_list = ["陈丹丹", "张萍", "杨上儒", "陈炜填", "贝少婷", "詹翠萍"]
@@ -166,9 +180,6 @@ class InventoryManager:
         return res
 
     def check_whole_match_debug(self, sku, target_fnsku, qty, candidates):
-        """
-        寻找整单满足的仓库 (带调试信息)
-        """
         logs = []
         for src_type, src_name in candidates:
             total_avail = 0
@@ -223,7 +234,6 @@ class InventoryManager:
                                 self.stock[sku][other_f][src_name] -= take
                                 qty_remain -= take
                                 take_total += take
-                                # 记录加工
                                 breakdown_notes.append(f"{src_name}(加工)")
                                 process_details['wh'].append(src_name)
                                 process_details['fnsku'].append(other_f)
@@ -249,7 +259,7 @@ class InventoryManager:
 # ==========================================
 def run_allocation(df_input, inv_mgr, df_plan, mapping):
     tasks = []
-    calc_logs = [] # 详细计算过程
+    calc_logs = []
     
     # --- 1. 提货计划 (Tier -1) ---
     if df_plan is not None and not df_plan.empty:
@@ -348,13 +358,12 @@ def run_allocation(df_input, inv_mgr, df_plan, mapping):
                 debug_info.append(f"命中整单: {whole_match[0][1]} -> 扣减成功")
                 debug_info.extend(d_logs)
             else:
-                # Step 2: 失败 -> 待下单
+                # Step 2: 失败 -> 待下单 (不进行瀑布流兜底)
                 filled = 0
                 notes = [f"待下单(需{to_int(qty)})"]
                 srcs = []
                 debug_info.append("无单一仓库满足 -> 转为待下单")
         
-        # 记录日志
         calc_logs.append({
             "步骤": f"Tier {t['priority']} ({t['tag']})", 
             "SKU": sku, "国家": t['country'], "需求": to_int(qty),
@@ -435,7 +444,7 @@ if 'df_demand' not in st.session_state:
 col_main, col_side = st.columns([75, 25])
 
 with col_main:
-    st.subheader("1. 需求填报 (V22.0 严谨版)")
+    st.subheader("1. 需求填报 (V22.1 锁定列版)")
     st.info("💡 请直接粘贴 Excel 数据")
     
     edited_df = st.data_editor(
@@ -463,8 +472,8 @@ with col_main:
 
 with col_side:
     st.subheader("2. 库存文件")
-    f_inv = st.file_uploader("库存表", type=['xlsx', 'xls', 'csv'])
-    f_po = st.file_uploader("PO表", type=['xlsx', 'xls', 'csv'])
+    f_inv = st.file_uploader("库存表 (必含'可用')", type=['xlsx', 'xls', 'csv'])
+    f_po = st.file_uploader("PO表 (必含'未入库')", type=['xlsx', 'xls', 'csv'])
     f_plan = st.file_uploader("计划表", type=['xlsx', 'xls', 'csv'])
     
     if st.button("🚀 开始计算", type="primary", use_container_width=True):
@@ -492,7 +501,7 @@ with col_side:
                         st.dataframe(final_df.style.apply(highlight, axis=1), use_container_width=True)
                         
                     with tab2:
-                        st.info("这里展示每一行需求的具体扣减逻辑，用于排查结果：")
+                        st.info("展示每一行需求的判断逻辑：")
                         st.dataframe(df_calc, use_container_width=True)
                         
                     with tab3:
@@ -500,7 +509,7 @@ with col_side:
                             st.warning(f"共过滤 {len(df_clean)} 条脏数据/黑名单数据")
                             st.dataframe(df_clean, use_container_width=True)
                         else:
-                            st.success("无数据被过滤")
+                            st.success("数据完美！无过滤项")
                     
                     buf = io.BytesIO()
                     with pd.ExcelWriter(buf, engine='xlsxwriter') as writer:
