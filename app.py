@@ -2,12 +2,11 @@ import streamlit as st
 import pandas as pd
 import io
 import copy
-import re
 
 # ==========================================
 # 1. 基础配置
 # ==========================================
-st.set_page_config(page_title="智能调拨系统 V19.0 (自动优先级版)", layout="wide", page_icon="🦁")
+st.set_page_config(page_title="智能调拨系统 V20.0 (US整单严格版)", layout="wide", page_icon="🦁")
 
 hide_st_style = """
     <style>
@@ -19,7 +18,7 @@ hide_st_style = """
     </style>
     """
 st.markdown(hide_st_style, unsafe_allow_html=True)
-st.title("🦁 智能库存分配 V19.0 (W3优先W4-自动排序)")
+st.title("🦁 智能库存分配 V20.0 (US整单严格版)")
 
 # ==========================================
 # 2. 数据清洗与辅助函数
@@ -37,17 +36,10 @@ def to_int(x):
     except: return 0
 
 def normalize_wh_name(name):
-    """
-    通用仓库名称标准化逻辑
-    规则：
-    1. 包含'深' -> 深仓
-    2. 包含'外协' -> 外协
-    3. 包含'云'或'天源' -> 云仓
-    4. 包含'PO'或'采购' -> 采购订单
-    """
-    n = str(name).strip().upper() # 转大写处理
+    """仓库名称标准化"""
+    n = str(name).strip().upper()
     if "深" in n: return "深仓"
-    if "外协" in n: return "外协" # 只要包含外协两个字
+    if "外协" in n: return "外协"
     if "云" in n or "天源" in n: return "云仓"
     if "PO" in n or "采购" in n: return "采购订单"
     return "其他"
@@ -83,13 +75,6 @@ def load_and_find_header(file, type_tag):
     except Exception as e:
         return None, f"读取错误: {str(e)}"
 
-def smart_col(df, candidates):
-    for c in df.columns:
-        if c in candidates: return c
-        for cand in candidates:
-            if cand in c: return c
-    return None
-
 # ==========================================
 # 3. 核心：库存管理器
 # ==========================================
@@ -97,26 +82,28 @@ class InventoryManager:
     def __init__(self, df_inv, df_po):
         self.stock = {} 
         self.po = {}
-        self.orig_stock = {}
-        self.orig_po = {}
         self.stats = {'total_stock': 0, 'filtered': 0}
         
         self._init_inventory(df_inv)
         self._init_po(df_po)
+        # 原始快照用于计算剩余
         self.orig_stock = copy.deepcopy(self.stock)
         self.orig_po = copy.deepcopy(self.po)
 
     def _init_inventory(self, df):
         if df is None or df.empty: return
         
-        c_sku = smart_col(df, ['SKU'])
-        c_fnsku = smart_col(df, ['FNSKU'])
-        c_wh = smart_col(df, ['仓库名称', '仓库'])
-        c_qty = smart_col(df, ['可用库存', '数量'])
+        # 简单列匹配
+        c_sku = next((c for c in df.columns if 'SKU' in c.upper()), None)
+        c_fnsku = next((c for c in df.columns if 'FNSKU' in c.upper()), None)
+        c_wh = next((c for c in df.columns if '仓库' in c), None)
+        c_qty = next((c for c in df.columns if '数量' in c or '库存' in c), None)
+
+        if not (c_sku and c_wh and c_qty): return
 
         for _, row in df.iterrows():
             w_name = str(row.get(c_wh, ''))
-            # 过滤逻辑
+            # 过滤黑名单仓库
             if any(x in w_name.upper() for x in ["沃尔玛", "WALMART", "TEMU"]):
                 self.stats['filtered'] += 1
                 continue
@@ -130,25 +117,23 @@ class InventoryManager:
             
             if qty <= 0: continue
             
-            # 使用统一的标准化逻辑
             w_type = normalize_wh_name(w_name)
             self.stats['total_stock'] += qty
             
             if sku not in self.stock: self.stock[sku] = {}
-            if fnsku not in self.stock[sku]: self.stock[sku][fnsku] = {'深仓':0, '外协':0, '云仓':0, '其他':0}
+            if fnsku not in self.stock[sku]: self.stock[sku][fnsku] = {'深仓':0, '外协':0, '云仓':0, '采购订单':0, '其他':0}
             self.stock[sku][fnsku][w_type] = self.stock[sku][fnsku].get(w_type, 0) + qty
 
     def _init_po(self, df):
         if df is None or df.empty: return
         
-        c_sku = smart_col(df, ['SKU'])
-        c_qty = smart_col(df, ['未入库量', '数量'])
-        c_req = smart_col(df, ['需求人', '申请人'])
+        c_sku = next((c for c in df.columns if 'SKU' in c.upper()), None)
+        c_qty = next((c for c in df.columns if '未入库' in c or '数量' in c), None)
+        c_req = next((c for c in df.columns if '人' in c or '员' in c), None)
         
         block_list = ["陈丹丹", "张萍", "杨上儒", "陈炜填", "贝少婷", "詹翠萍"]
         
         for _, row in df.iterrows():
-            # 黑名单过滤
             if c_req:
                 req = str(row.get(c_req, ''))
                 if any(b in req for b in block_list): continue
@@ -160,16 +145,36 @@ class InventoryManager:
                 self.po[sku] = self.po.get(sku, 0) + qty
 
     def get_snapshot(self, sku):
-        res = {'深仓':0, '外协':0, '云仓':0, 'PO': self.po.get(sku, 0)}
+        res = {'深仓':0, '外协':0, '云仓':0, '采购订单': self.po.get(sku, 0)}
         if sku in self.stock:
             for f in self.stock[sku]:
-                for w in ['深仓', '外协', '云仓']:
+                for w in res.keys():
                     res[w] += self.stock[sku][f].get(w, 0)
         return res
 
+    def find_whole_match(self, sku, target_fnsku, qty, candidates):
+        """
+        寻找整单满足的仓库
+        candidates: [('stock', '外协'), ('stock', '云仓')...]
+        """
+        for src_type, src_name in candidates:
+            total_avail = 0
+            if src_type == 'stock':
+                if sku in self.stock:
+                    # 优先看同FNSKU是否满足? 不，通常看该仓库下该SKU的总数(含加工)是否满足
+                    # 这里为了最大化利用，我们计算该仓库下该SKU所有FNSKU的总和
+                    for f in self.stock[sku]:
+                        total_avail += self.stock[sku][f].get(src_name, 0)
+            elif src_type == 'po':
+                total_avail = self.po.get(sku, 0)
+            
+            if total_avail >= qty:
+                return [(src_type, src_name)] # 返回单一策略
+        return None
+
     def execute_deduction(self, sku, target_fnsku, qty_needed, strategy_chain):
         """
-        核心扣减逻辑
+        执行扣减
         """
         qty_remain = qty_needed
         breakdown_notes = []
@@ -223,297 +228,235 @@ class InventoryManager:
 
         return qty_needed - qty_remain, breakdown_notes, used_sources, process_details
 
-    def find_best_single_warehouse(self, sku, target_fnsku, qty_needed, candidates):
-        """
-        US策略优化：寻找能一次性满足需求的仓库
-        """
-        for src_type, src_name in candidates:
-            total_avail = 0
-            if src_type == 'stock' and sku in self.stock:
-                for f in self.stock[sku]:
-                    total_avail += self.stock[sku][f].get(src_name, 0)
-            elif src_type == 'po':
-                total_avail = self.po.get(sku, 0)
-            
-            if total_avail >= qty_needed:
-                return (src_type, src_name)
-        return None
-
 # ==========================================
-# 4. 策略生成器 (含 US 优化)
+# 4. 主逻辑流程
 # ==========================================
-def get_strategy(inv_mgr, sku, target_fnsku, qty, country, preferred_status=None):
-    """
-    生成扣减顺序
-    preferred_status: 原始状态 (如 '深圳仓库存')，用于 Base 任务
-    """
-    is_us = 'US' in str(country).upper()
-    
-    # 基础优先级池
-    pool_non_us = [('stock', '深仓'), ('stock', '云仓'), ('stock', '外协'), ('po', '采购订单')]
-    pool_us = [('stock', '外协'), ('stock', '云仓'), ('stock', '深仓'), ('po', '采购订单')]
-    
-    # 1. 如果有原始状态 (Tier 0)，强制置顶
-    final_strategy = []
-    base_pool = pool_us if is_us else pool_non_us
-    
-    if preferred_status:
-        # 使用 fuzzy matching 标准化用户输入
-        std_status = normalize_wh_name(preferred_status)
-        if std_status != "其他":
-            target = next((x for x in base_pool if x[1] == std_status), None)
-            if target:
-                final_strategy.append(target)
-                base_pool = [x for x in base_pool if x != target]
-    
-    # 2. US 整仓优先策略
-    if is_us:
-        best_single = inv_mgr.find_best_single_warehouse(sku, target_fnsku, qty, base_pool)
-        if best_single:
-            if best_single in base_pool:
-                base_pool.remove(best_single)
-                base_pool.insert(0, best_single)
-    
-    final_strategy.extend(base_pool)
-    return final_strategy
-
-# ==========================================
-# 5. 主逻辑流程
-# ==========================================
-def run_allocation(df_input, inv_mgr, df_plan):
+def run_allocation(df_input, inv_mgr, df_plan, mapping):
     tasks = []
     
     # --- 1. 提货计划 (Tier -1) ---
     if df_plan is not None and not df_plan.empty:
-        c_sku = smart_col(df_plan, ['SKU'])
-        c_qty = smart_col(df_plan, ['数量', '计划'])
+        # 简单自动识别列
+        c_sku = next((c for c in df_plan.columns if 'SKU' in c.upper()), None)
+        c_qty = next((c for c in df_plan.columns if '数量' in c or '计划' in c), None)
+        c_country = next((c for c in df_plan.columns if '国家' in c), None)
+        
         if c_sku and c_qty:
             for _, row in df_plan.iterrows():
                 sku = str(row.get(c_sku, '')).strip()
                 qty = clean_number(row.get(c_qty, 0))
+                cty = str(row.get(c_country, 'Non-US'))
                 if qty > 0:
-                    strat = get_strategy(inv_mgr, sku, "", qty, "Non-US") 
+                    # 计划表默认走非US瀑布流，或根据国家判断，这里简化处理，确保扣减
+                    strat = [('stock', '深仓'), ('stock', '外协'), ('stock', '云仓'), ('po', '采购订单')]
                     inv_mgr.execute_deduction(sku, "", qty, strat)
 
-    # --- 2. 任务拆解 (Tier 0-4) ---
+    # --- 2. 任务拆解 (Tier 1-4) ---
+    # 使用用户映射的列名
+    col_tag = mapping['标签']
+    col_country = mapping['国家']
+    col_sku = mapping['SKU']
+    col_fnsku = mapping['FNSKU']
+    col_qty = mapping['数量']
+    
     for idx, row in df_input.iterrows():
-        sku = str(row['SKU']).strip()
-        fnsku = str(row.get('FNSKU', '')).strip()
-        country = str(row['国家']).strip()
-        # [修改点] 移除标签列的读取，完全依赖数值列判断优先级
+        tag = str(row.get(col_tag, '')).strip()
+        country = str(row.get(col_country, '')).strip()
+        sku = str(row.get(col_sku, '')).strip()
+        fnsku = str(row.get(col_fnsku, '')).strip()
+        qty = clean_number(row.get(col_qty, 0))
         
-        # 数量读取
-        w3_orig = clean_number(row.get('第三周发货原始数量', 0))
-        w3_final = clean_number(row.get('第三周发货最终数量', 0))
-        w3_status = str(row.get('第三周发货原始状态', ''))
-        w4_qty = clean_number(row.get('第四周发货原始数量', 0))
+        if qty <= 0 or not sku: continue
         
-        is_us = 'US' in country.upper()
+        is_us = 'US' in country.upper() or '美国' in country
+        is_new = '新增' in tag
         
-        # Task A: W3 Base (Tier 0) - 最高优先
-        if w3_orig > 0:
-            tasks.append({
-                'row_idx': idx, 'type': 'w3_base', 'priority': 0,
-                'sku': sku, 'fnsku': fnsku, 'country': country, 'qty': w3_orig,
-                'pref_status': w3_status 
-            })
+        # 优先级计算
+        # Tier 1: 新增 & 非US
+        # Tier 2: 新增 & US
+        # Tier 3: 当周 & 非US
+        # Tier 4: 当周 & US
+        priority = 0
+        if is_new:
+            priority = 2 if is_us else 1
+        else:
+            priority = 4 if is_us else 3
             
-        # Task B: W3 Incr (Tier 1/2) - 次优先
-        incr = w3_final - w3_orig
-        if incr > 0:
-            p = 2 if is_us else 1
-            tasks.append({
-                'row_idx': idx, 'type': 'w3_incr', 'priority': p,
-                'sku': sku, 'fnsku': fnsku, 'country': country, 'qty': incr,
-                'pref_status': None
-            })
-            
-        # Task C: W4 Week (Tier 3/4) - 最后分配
-        if w4_qty > 0:
-            p = 4 if is_us else 3
-            tasks.append({
-                'row_idx': idx, 'type': 'w4', 'priority': p,
-                'sku': sku, 'fnsku': fnsku, 'country': country, 'qty': w4_qty,
-                'pref_status': None
-            })
+        tasks.append({
+            'row_idx': idx, 'priority': priority,
+            'sku': sku, 'fnsku': fnsku, 'qty': qty, 'country': country,
+            'is_us': is_us
+        })
 
     # --- 3. 执行分配 ---
-    # 排序保证：W3 Base(0) -> Non-US Incr(1) -> US Incr(2) -> Non-US W4(3) -> US W4(4)
     tasks.sort(key=lambda x: x['priority'])
     
     results = {} 
     
     for t in tasks:
         rid = t['row_idx']
-        if rid not in results:
-            results[rid] = {
-                'w3_final': 0, 'w3_filled': 0, 
-                'w4_final': 0, 'w4_filled': 0,
-                'w3_src': [], 'w4_src': [],
-                'w3_proc': {'wh':[], 'fnsku':[], 'qty':0},
-                'w4_proc': {'wh':[], 'fnsku':[], 'qty':0}
-            }
-            
-        strat = get_strategy(inv_mgr, t['sku'], t['fnsku'], t['qty'], t['country'], t['pref_status'])
-        filled, notes, srcs, proc = inv_mgr.execute_deduction(t['sku'], t['fnsku'], t['qty'], strat)
+        sku = t['sku']
+        fnsku = t['fnsku']
+        qty = t['qty']
+        is_us = t['is_us']
         
-        # 归档结果
-        if 'w3' in t['type']:
-            results[rid]['w3_final'] += t['qty']
-            results[rid]['w3_filled'] += filled
-            results[rid]['w3_src'].extend(srcs)
-            results[rid]['w3_proc']['wh'].extend(proc['wh'])
-            results[rid]['w3_proc']['fnsku'].extend(proc['fnsku'])
-            results[rid]['w3_proc']['qty'] += proc['qty']
+        strat = []
+        
+        if not is_us:
+            # Non-US: 瀑布流 (深 > 外 > 云 > PO)
+            strat = [
+                ('stock', '深仓'), ('stock', '外协'), ('stock', '云仓'), ('po', '采购订单')
+            ]
+            filled, notes, srcs, proc = inv_mgr.execute_deduction(sku, fnsku, qty, strat)
         else:
-            results[rid]['w4_final'] += t['qty']
-            results[rid]['w4_filled'] += filled
-            results[rid]['w4_src'].extend(srcs)
-            results[rid]['w4_proc']['wh'].extend(proc['wh'])
-            results[rid]['w4_proc']['fnsku'].extend(proc['fnsku'])
-            results[rid]['w4_proc']['qty'] += proc['qty']
+            # US: 整单优先 (外 > 云 > PO > 深) -> 若不满足则待下单
+            candidates = [
+                ('stock', '外协'), ('stock', '云仓'), ('po', '采购订单'), ('stock', '深仓')
+            ]
+            # Step 1: 寻找整单
+            whole_match_strat = inv_mgr.find_whole_match(sku, fnsku, qty, candidates)
+            
+            if whole_match_strat:
+                # 找到了，执行扣减
+                filled, notes, srcs, proc = inv_mgr.execute_deduction(sku, fnsku, qty, whole_match_strat)
+            else:
+                # 没找到整单，直接待下单 (Step 2 fallback is REMOVED as per request)
+                filled = 0
+                notes = ["无整单满足，待下单"]
+                srcs = []
+                proc = {'wh': [], 'fnsku': [], 'qty': 0}
 
-    # --- 4. 构建输出表 ---
-    output_rows = []
-    for idx, row in df_input.iterrows():
-        res = results.get(idx, {
-            'w3_final':0, 'w3_filled':0, 'w4_final':0, 'w4_filled':0,
-            'w3_src':[], 'w4_src':[], 
-            'w3_proc':{'wh':[], 'fnsku':[], 'qty':0},
-            'w4_proc':{'wh':[], 'fnsku':[], 'qty':0}
-        })
-        
-        # 基础数据
-        sku = str(row['SKU'])
-        w3_orig = clean_number(row.get('第三周发货原始数量', 0))
-        
-        calc_w3_total = res['w3_final']
-        calc_w4_total = res['w4_final']
-        
-        # 状态生成
-        w3_status_str = "+".join(sorted(set(res['w3_src']))) if res['w3_src'] else "无"
-        w4_status_str = "+".join(sorted(set(res['w4_src']))) if res['w4_src'] else "无"
-        
-        # 增量来源分析
-        orig_stat = str(row.get('第三周发货原始状态', ''))
-        norm_orig_stat = normalize_wh_name(orig_stat)
-        
-        w3_compare_str = f"[原:{orig_stat}]"
-        diff_src = []
-        for s in res['w3_src']:
-             if normalize_wh_name(s) != norm_orig_stat:
-                 diff_src.append(s)
-                 
-        if diff_src:
-            w3_compare_str += f" + [增:{'+'.join(set(diff_src))}]"
-            
-        # 满足度
-        shortage = (calc_w3_total + calc_w4_total) - (res['w3_filled'] + res['w4_filled'])
-        is_full = "✅ 全满足" if shortage <= 0 else f"❌ 不满足 (缺{to_int(shortage)})"
-        
-        # 加工信息 W3
-        w3_p_fn = ";".join(res['w3_proc']['fnsku'])
-        w3_p_wh = ";".join(set(res['w3_proc']['wh']))
-        w3_p_qt = to_int(res['w3_proc']['qty']) if res['w3_proc']['qty'] > 0 else ""
-        
-        # 加工信息 W4
-        w4_p_fn = ";".join(res['w4_proc']['fnsku'])
-        w4_p_wh = ";".join(set(res['w4_proc']['wh']))
-        w4_p_qt = to_int(res['w4_proc']['qty']) if res['w4_proc']['qty'] > 0 else ""
-        
-        # 剩余库存
-        snap = inv_mgr.get_snapshot(sku)
-        
-        out_row = {
-            "国家": row['国家'],
-            "SKU": sku,
-            "FNSKU": row.get('FNSKU', ''),
-            
-            # W3 信息
-            "第三周发货原始数量": to_int(w3_orig),
-            "第三周发货原始状态": orig_stat,
-            "第三周发货最终数量": to_int(calc_w3_total),
-            "第三周发货最终状态": w3_status_str,
-            "第三周需加工FNSKU": w3_p_fn,
-            "第三周加工库区": w3_p_wh,
-            "第三周加工数量": w3_p_qt,
-            
-            # W4 信息
-            "第四周发货原始数量": to_int(calc_w4_total),
-            "第四周发货最终状态": w4_status_str,
-            "第四周需加工FNSKU": w4_p_fn,
-            "第四周加工库区": w4_p_wh,
-            "第四周加工数量": w4_p_qt,
-            
-            # 对比与统计
-            "第三周需求对比(原->新)": f"{to_int(w3_orig)} -> {to_int(calc_w3_total)}",
-            "最终发货总数": to_int(res['w3_filled'] + res['w4_filled']),
-            "发货对比(原->终)": f"{to_int(min(w3_orig, res['w3_filled']))} -> {to_int(res['w3_filled'] + res['w4_filled'])}",
-            "是否全满足": is_full,
-            "库存分配状态对比": w3_compare_str,
-            
-            # 剩余
-            "剩_深仓": to_int(snap['深仓']),
-            "剩_外协": to_int(snap['外协']),
-            "剩_云仓": to_int(snap['云仓']),
-            "剩_PO": to_int(snap['PO']),
-            
-            # 辅助
-            "运营": row.get('运营', ''),
-            "店铺": row.get('店铺', ''),
-            "备注": row.get('备注', '')
+        results[rid] = {
+            'filled': filled, 'notes': notes, 'srcs': srcs, 'proc': proc
         }
+
+    # --- 4. 构建输出 ---
+    output_rows = []
+    
+    # 辅助：计算SKU级缺货状态
+    sku_shortage_map = {} # SKU -> Total Shortage
+    for idx, row in df_input.iterrows():
+        qty = clean_number(row.get(col_qty, 0))
+        if idx in results:
+            short = qty - results[idx]['filled']
+            if short > 0.001:
+                sku = str(row.get(col_sku, '')).strip()
+                sku_shortage_map[sku] = sku_shortage_map.get(sku, 0) + short
+    
+    for idx, row in df_input.iterrows():
+        res = results.get(idx)
+        
+        # 复制原始行数据
+        out_row = row.to_dict()
+        
+        if res:
+            qty = clean_number(row.get(col_qty, 0))
+            filled = res['filled']
+            
+            # 库存状态
+            status_str = "+".join(sorted(set(res['srcs']))) if res['srcs'] else "待下单"
+            
+            # 加工信息
+            p_wh = ";".join(set(res['proc']['wh']))
+            p_fn = ";".join(res['proc']['fnsku'])
+            p_qt = to_int(res['proc']['qty']) if res['proc']['qty'] > 0 else ""
+            
+            # 剩余快照
+            sku = str(row.get(col_sku, '')).strip()
+            snap = inv_mgr.get_snapshot(sku)
+            
+            # 缺货状态 (SKU级)
+            total_sku_short = sku_shortage_map.get(sku, 0)
+            short_status = f"❌ 缺货 (该SKU总缺 {to_int(total_sku_short)})" if total_sku_short > 0 else "✅ 全满足"
+            
+            out_row.update({
+                "库存状态": status_str,
+                "最终发货数量": to_int(filled),
+                "缺货与否": short_status,
+                "加工库区": p_wh,
+                "加工FNSKU": p_fn,
+                "加工数量": p_qt,
+                "剩_深仓": to_int(snap['深仓']),
+                "剩_外协": to_int(snap['外协']),
+                "剩_云仓": to_int(snap['云仓']),
+                "剩_PO": to_int(snap['采购订单'])
+            })
+        else:
+            # 对于不需要分配的行（如数量为0），填空
+            out_row.update({
+                "库存状态": "-", "最终发货数量": 0, "缺货与否": "-",
+                "加工库区": "", "加工FNSKU": "", "加工数量": "",
+                "剩_深仓":0, "剩_外协":0, "剩_云仓":0, "剩_PO":0
+            })
+            
         output_rows.append(out_row)
 
     df_out = pd.DataFrame(output_rows)
-    if not df_out.empty:
-        df_out.sort_values(by=['SKU', '国家'], inplace=True)
+    
+    # 排序：SKU -> 标签(优先级) -> 国家
+    # 这里的排序需要简单处理一下
+    if not df_out.empty and col_sku in df_out.columns:
+        df_out.sort_values(by=[col_sku], inplace=True)
         
+        # 调整列顺序：把结果列放到前面或后面
+        # 优先保留用户输入的列，然后追加计算结果列
+        base_cols = list(df_input.columns)
+        calc_cols = [
+            "库存状态", "最终发货数量", "缺货与否", 
+            "加工库区", "加工FNSKU", "加工数量", 
+            "剩_深仓", "剩_外协", "剩_云仓", "剩_PO"
+        ]
+        final_cols = base_cols + [c for c in calc_cols if c not in base_cols]
+        df_out = df_out[final_cols]
+
     return df_out
 
 # ==========================================
-# 6. UI 渲染
+# 5. UI 渲染
 # ==========================================
 # 初始化 Session State
 if 'df_demand' not in st.session_state:
-    st.session_state.df_demand = pd.DataFrame([{
-        "国家": "US", "SKU": "TEST-001", "FNSKU": "F001",
-        "第三周发货原始数量": 50, "第三周发货原始状态": "深圳仓库存",
-        "第三周发货最终数量": 80,
-        "第四周发货原始数量": 20,
-        "运营": "Op1", "店铺": "Shop1", "备注": ""
-    }])
+    st.session_state.df_demand = pd.DataFrame(columns=["标签", "国家", "SKU", "FNSKU", "数量", "运营", "店铺", "备注"])
 
 col_main, col_side = st.columns([75, 25])
 
 with col_main:
-    st.subheader("1. 需求填报 (在线编辑)")
-    st.info("💡 请直接在下方表格输入数据，右键可增加行/删除行")
-    
-    # [修改点] 移除标签列配置，国家列改为自由文本
-    col_config = {
-        "国家": st.column_config.TextColumn("国家", required=True),
-        "SKU": st.column_config.TextColumn("SKU", required=True),
-        "第三周发货原始数量": st.column_config.NumberColumn("W3原始数", min_value=0),
-        "第三周发货最终数量": st.column_config.NumberColumn("W3最终数", min_value=0),
-        "第四周发货原始数量": st.column_config.NumberColumn("W4原始数", min_value=0),
-    }
+    st.subheader("1. 需求填报 (支持粘贴/增删列)")
+    st.info("💡 请直接粘贴 Excel 数据，或右键增加列/行")
     
     edited_df = st.data_editor(
         st.session_state.df_demand,
         num_rows="dynamic",
         use_container_width=True,
-        column_config=col_config,
-        height=400
+        height=400,
+        key="editor"
     )
     
-    if not edited_df.equals(st.session_state.df_demand):
-        st.session_state.df_demand = edited_df
+    # 自动识别列名用于下拉框默认值
+    cols = list(edited_df.columns)
+    def get_idx(candidates):
+        for i, c in enumerate(cols):
+            if c in candidates: return i
+            for cand in candidates:
+                if cand in c: return i
+        return 0
+
+    st.write("🔧 **列映射配置** (请确认系统识别是否正确)")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    map_tag = c1.selectbox("标签列", cols, index=get_idx(['标签', 'Tag']))
+    map_country = c2.selectbox("国家列", cols, index=get_idx(['国家', 'Country']))
+    map_sku = c3.selectbox("SKU列", cols, index=get_idx(['SKU', 'sku']))
+    map_fnsku = c4.selectbox("FNSKU列", cols, index=get_idx(['FNSKU', 'FnSKU']))
+    map_qty = c5.selectbox("数量列", cols, index=get_idx(['数量', 'Qty']))
+    
+    mapping = {
+        '标签': map_tag, '国家': map_country, 'SKU': map_sku, 'FNSKU': map_fnsku, '数量': map_qty
+    }
 
 with col_side:
     st.subheader("2. 库存文件")
-    f_inv = st.file_uploader("库存表 (必填)", type=['xlsx', 'csv'])
-    f_po = st.file_uploader("PO表 (必填)", type=['xlsx', 'csv'])
+    f_inv = st.file_uploader("库存表", type=['xlsx', 'csv'])
+    f_po = st.file_uploader("PO表", type=['xlsx', 'csv'])
     f_plan = st.file_uploader("计划表 (选填)", type=['xlsx', 'csv'])
     
     st.divider()
@@ -529,20 +472,23 @@ with col_side:
                 elif err2: st.error(err2)
                 else:
                     mgr = InventoryManager(df_inv_raw, df_po_raw)
-                    final_df = run_allocation(edited_df, mgr, df_plan_raw)
+                    final_df = run_allocation(edited_df, mgr, df_plan_raw, mapping)
                     
                     st.success("计算完成!")
                     
+                    # 样式：缺货标红
                     def highlight(row):
-                        return ['background-color: #ffcdd2' if "不满足" in str(row['是否全满足']) else '' for _ in row]
+                        if "缺货" in str(row.get('缺货与否', '')):
+                            return ['background-color: #ffcdd2'] * len(row)
+                        return [''] * len(row)
                     
                     st.dataframe(final_df.style.apply(highlight, axis=1), use_container_width=True)
                     
                     buf = io.BytesIO()
                     with pd.ExcelWriter(buf, engine='xlsxwriter') as writer:
-                        final_df.to_excel(writer, sheet_name='结果', index=False)
-                        writer.sheets['结果'].freeze_panes(1, 0)
+                        final_df.to_excel(writer, sheet_name='分配结果', index=False)
+                        writer.sheets['分配结果'].freeze_panes(1, 0)
                     
-                    st.download_button("📥 下载结果.xlsx", buf.getvalue(), "V19_Result.xlsx")
+                    st.download_button("📥 下载结果.xlsx", buf.getvalue(), "V20_Result.xlsx")
         else:
-            st.warning("请完善需求表并上传库存文件")
+            st.warning("请填写需求数据并上传库存文件")
