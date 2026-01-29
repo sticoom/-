@@ -6,7 +6,7 @@ import copy
 # ==========================================
 # 1. 基础配置
 # ==========================================
-st.set_page_config(page_title="智能调拨系统 V20.0 (US整单严格版)", layout="wide", page_icon="🦁")
+st.set_page_config(page_title="智能调拨系统 V20.1 (多格式支持版)", layout="wide", page_icon="🦁")
 
 hide_st_style = """
     <style>
@@ -18,7 +18,7 @@ hide_st_style = """
     </style>
     """
 st.markdown(hide_st_style, unsafe_allow_html=True)
-st.title("🦁 智能库存分配 V20.0 (US整单严格版)")
+st.title("🦁 智能库存分配 V20.1 (US整单严格版 + 多格式支持)")
 
 # ==========================================
 # 2. 数据清洗与辅助函数
@@ -55,6 +55,7 @@ def load_and_find_header(file, type_tag):
                 file.seek(0)
                 df = pd.read_csv(file, encoding='gbk')
         else:
+            # pd.read_excel 默认支持 xlsx 和 xls
             df = pd.read_excel(file)
             
         # 寻找表头
@@ -240,16 +241,19 @@ def run_allocation(df_input, inv_mgr, df_plan, mapping):
         c_sku = next((c for c in df_plan.columns if 'SKU' in c.upper()), None)
         c_qty = next((c for c in df_plan.columns if '数量' in c or '计划' in c), None)
         c_country = next((c for c in df_plan.columns if '国家' in c), None)
+        c_fnsku = next((c for c in df_plan.columns if 'FNSKU' in c.upper()), None)
         
         if c_sku and c_qty:
             for _, row in df_plan.iterrows():
                 sku = str(row.get(c_sku, '')).strip()
+                f_raw = row.get(c_fnsku, '') if c_fnsku else ''
+                fnsku = str(f_raw).strip() if pd.notna(f_raw) else ""
                 qty = clean_number(row.get(c_qty, 0))
                 cty = str(row.get(c_country, 'Non-US'))
                 if qty > 0:
                     # 计划表默认走非US瀑布流，或根据国家判断，这里简化处理，确保扣减
                     strat = [('stock', '深仓'), ('stock', '外协'), ('stock', '云仓'), ('po', '采购订单')]
-                    inv_mgr.execute_deduction(sku, "", qty, strat)
+                    inv_mgr.execute_deduction(sku, fnsku, qty, strat)
 
     # --- 2. 任务拆解 (Tier 1-4) ---
     # 使用用户映射的列名
@@ -320,7 +324,7 @@ def run_allocation(df_input, inv_mgr, df_plan, mapping):
                 # 找到了，执行扣减
                 filled, notes, srcs, proc = inv_mgr.execute_deduction(sku, fnsku, qty, whole_match_strat)
             else:
-                # 没找到整单，直接待下单 (Step 2 fallback is REMOVED as per request)
+                # 没找到整单，直接待下单
                 filled = 0
                 notes = ["无整单满足，待下单"]
                 srcs = []
@@ -455,9 +459,10 @@ with col_main:
 
 with col_side:
     st.subheader("2. 库存文件")
-    f_inv = st.file_uploader("库存表", type=['xlsx', 'csv'])
-    f_po = st.file_uploader("PO表", type=['xlsx', 'csv'])
-    f_plan = st.file_uploader("计划表 (选填)", type=['xlsx', 'csv'])
+    # 支持多格式上传
+    f_inv = st.file_uploader("库存表", type=['xlsx', 'xls', 'csv'])
+    f_po = st.file_uploader("PO表", type=['xlsx', 'xls', 'csv'])
+    f_plan = st.file_uploader("计划表 (选填)", type=['xlsx', 'xls', 'csv'])
     
     st.divider()
     
