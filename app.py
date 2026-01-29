@@ -6,7 +6,7 @@ import copy
 # ==========================================
 # 1. 基础配置
 # ==========================================
-st.set_page_config(page_title="智能调拨系统 V26.0 (FNSKU优先版)", layout="wide", page_icon="🦁")
+st.set_page_config(page_title="智能调拨系统 V26.0 (FNSKU精准优先)", layout="wide", page_icon="🦁")
 
 hide_st_style = """
     <style>
@@ -18,7 +18,7 @@ hide_st_style = """
     </style>
     """
 st.markdown(hide_st_style, unsafe_allow_html=True)
-st.title("🦁 智能库存分配 V26.0 (US: 优先匹配FNSKU以减少加工)")
+st.title("🦁 智能库存分配 V26.0 (US双轮: 精准匹配 -> 加工补足)")
 
 # ==========================================
 # 2. 数据清洗与辅助函数
@@ -62,6 +62,7 @@ def load_and_find_header(file, type_tag):
             df = pd.read_excel(file)
             
         header_idx = -1
+        # 扩大搜索范围
         for i, row in df.head(30).iterrows():
             row_str = " ".join([str(v).upper() for v in row.values])
             if "SKU" in row_str:
@@ -172,33 +173,13 @@ class InventoryManager:
                     res[w_type] += total
         return res
 
-    def check_perfect_match(self, sku, target_fnsku, qty, candidates):
-        """
-        寻找完美的整单匹配 (FNSKU一致 + 数量足够)
-        """
-        logs = []
-        for src_type, src_name in candidates:
-            total_avail = 0
-            if src_type == 'stock':
-                if sku in self.stock and target_fnsku in self.stock[sku]:
-                    # 只看 Target FNSKU
-                    total_avail = sum(item['qty'] for item in self.stock[sku][target_fnsku].get(src_name, []))
-            elif src_type == 'po':
-                # 假设 PO 总是匹配的
-                total_avail = self.po.get(sku, 0)
-            
-            if total_avail >= qty:
-                logs.append(f"完美整单: {src_name} (FNSKU匹配) 库存{to_int(total_avail)} >= 需求{to_int(qty)}")
-                return [(src_type, src_name)], logs
-        return None, logs
-
     def execute_deduction(self, sku, target_fnsku, qty_needed, strategy_chain, mode='mixed'):
         """
-        核心扣减逻辑
+        核心扣减逻辑 (支持模式选择)
         mode: 
-          'strict_only': 只扣同FNSKU
-          'process_only': 只扣异FNSKU
-          'mixed': 优先同FNSKU，不够扣异FNSKU (传统瀑布流)
+          'mixed': 混合模式 (同一仓库内 先找匹配 -> 再找加工) -> 适用于 Non-US
+          'strict_only': 仅扣减完全匹配 FNSKU -> 适用于 US 第一轮
+          'process_only': 仅扣减不匹配 FNSKU -> 适用于 US 第二轮
         """
         qty_remain = qty_needed
         breakdown_notes = []
@@ -208,11 +189,13 @@ class InventoryManager:
         
         for src_type, src_name in strategy_chain:
             if qty_remain <= 0: break
+            
             step_taken = 0
             
             if src_type == 'stock':
                 if sku in self.stock:
-                    # --- 1. 同 FNSKU ---
+                    
+                    # --- A. 优先同 FNSKU (Strict / Mixed) ---
                     if mode in ['mixed', 'strict_only']:
                         if target_fnsku in self.stock[sku]:
                             items = self.stock[sku][target_fnsku].get(src_name, [])
@@ -227,7 +210,7 @@ class InventoryManager:
                                 step_taken += take
                                 deduction_log.append(f"{src_name}(直发,-{to_int(take)})")
                     
-                    # --- 2. 异 FNSKU (加工) ---
+                    # --- B. 加工 (Process / Mixed) ---
                     if mode in ['mixed', 'process_only']:
                         if qty_remain > 0:
                             for other_f in self.stock[sku]:
@@ -253,8 +236,8 @@ class InventoryManager:
                                     deduction_log.append(f"{src_name}(加工,-{to_int(take)})")
                                 
             elif src_type == 'po':
-                # PO 在 strict 和 mixed 模式下都可用
-                if mode in ['mixed', 'strict_only', 'process_only']:
+                # PO 默认视为匹配 (或通配)
+                if mode in ['mixed', 'strict_only', 'process_only']: 
                     avail = self.po.get(sku, 0)
                     take = min(avail, qty_remain)
                     if take > 0:
@@ -269,7 +252,7 @@ class InventoryManager:
         return qty_needed - qty_remain, breakdown_notes, used_sources, process_details, deduction_log
 
 # ==========================================
-# 4. 主逻辑流程 (V26.0)
+# 4. 主逻辑流程 (含 US 双轮策略)
 # ==========================================
 def run_allocation(df_input, inv_mgr, df_plan, mapping):
     tasks = []
@@ -291,8 +274,8 @@ def run_allocation(df_input, inv_mgr, df_plan, mapping):
                 cty = str(row.get(c_country, 'Non-US'))
                 if qty > 0:
                     snap = inv_mgr.get_snapshot(sku)
+                    # 计划表默认走 Non-US 瀑布流逻辑
                     strat = [('stock', '深仓'), ('stock', '外协'), ('stock', '云仓'), ('po', '采购订单')]
-                    # 计划表一般默认 Mixed 模式
                     filled, _, _, _, logs = inv_mgr.execute_deduction(sku, fnsku, qty, strat, mode='mixed')
                     
                     calc_logs.append({
@@ -351,51 +334,37 @@ def run_allocation(df_input, inv_mgr, df_plan, mapping):
         proc = {'raw_wh': [], 'zone': [], 'fnsku': [], 'qty': 0}
         
         if not is_us:
-            # Non-US: 混合瀑布流
+            # Non-US: 纯瀑布流 (Mixed Mode)
+            # 逻辑：同一仓库内，先找匹配，再找加工，然后去下一个仓库
             strategy_name = "Non-US 瀑布流"
             strat = [('stock', '深仓'), ('stock', '外协'), ('stock', '云仓'), ('po', '采购订单')]
             filled, notes, srcs, proc, d_logs = inv_mgr.execute_deduction(sku, fnsku, qty, strat, mode='mixed')
             debug_info = d_logs
         else:
-            # US: 整单优先 -> FNSKU 优先 -> 加工兜底
-            strategy_name = "US FNSKU优先"
-            # 统一顺序
+            # US: 双轮策略 (Strict First -> Process Fallback)
+            strategy_name = "US 双轮匹配"
+            # 统一 US 扫描顺序
             us_order = [('stock', '外协'), ('stock', '云仓'), ('po', '采购订单'), ('stock', '深仓')]
             
-            # Step 1: 完美整单检测 (FNSKU一致 + 数量够)
-            perfect_match, check_logs = inv_mgr.check_perfect_match(sku, fnsku, qty, us_order)
-            debug_info.extend(check_logs)
+            # --- 第一轮：精准匹配 (Strict) ---
+            filled_1, notes_1, srcs_1, proc_1, logs_1 = inv_mgr.execute_deduction(sku, fnsku, qty, us_order, mode='strict_only')
+            filled += filled_1
+            srcs.extend(srcs_1)
+            debug_info.extend(logs_1)
             
-            if perfect_match:
-                # 命中完美整单
-                filled, notes, srcs, proc, d_logs = inv_mgr.execute_deduction(sku, fnsku, qty, perfect_match, mode='strict_only')
-                debug_info.append("命中完美整单(无需加工)")
-                debug_info.extend(d_logs)
-            else:
-                # Step 2: 严格搜刮 (Strict Waterfall)
-                # 先把所有同FNSKU的货用完，哪怕需要拼凑仓库
-                debug_info.append("无完美整单 -> 进入Strict搜刮(优先同FNSKU)")
-                filled_1, notes_1, srcs_1, proc_1, logs_1 = inv_mgr.execute_deduction(sku, fnsku, qty, us_order, mode='strict_only')
+            # --- 第二轮：加工兜底 (Process) ---
+            remaining_qty = qty - filled
+            if remaining_qty > 0:
+                filled_2, notes_2, srcs_2, proc_2, logs_2 = inv_mgr.execute_deduction(sku, fnsku, remaining_qty, us_order, mode='process_only')
+                filled += filled_2
+                srcs.extend(srcs_2)
                 
-                filled += filled_1
-                srcs.extend(srcs_1)
-                debug_info.extend(logs_1)
-                
-                # Step 3: 加工补齐 (Process Fallback)
-                remaining = qty - filled
-                if remaining > 0:
-                    debug_info.append(f"仍缺{to_int(remaining)} -> 进入加工兜底")
-                    filled_2, notes_2, srcs_2, proc_2, logs_2 = inv_mgr.execute_deduction(sku, fnsku, remaining, us_order, mode='process_only')
-                    
-                    filled += filled_2
-                    srcs.extend(srcs_2)
-                    debug_info.extend(logs_2)
-                    
-                    # 合并加工信息
-                    proc['raw_wh'].extend(proc_2['raw_wh'])
-                    proc['zone'].extend(proc_2['zone'])
-                    proc['fnsku'].extend(proc_2['fnsku'])
-                    proc['qty'] += proc_2['qty']
+                # 合并加工信息
+                proc['raw_wh'].extend(proc_2['raw_wh'])
+                proc['zone'].extend(proc_2['zone'])
+                proc['fnsku'].extend(proc_2['fnsku'])
+                proc['qty'] += proc_2['qty']
+                debug_info.extend(logs_2)
             
             if filled < qty:
                 notes.append(f"待下单(需{to_int(qty - filled)})")
@@ -484,7 +453,7 @@ if 'df_demand' not in st.session_state:
 col_main, col_side = st.columns([75, 25])
 
 with col_main:
-    st.subheader("1. 需求填报 (V26.0 双轮精准版)")
+    st.subheader("1. 需求填报 (V26.0 双轮版)")
     st.info("💡 请直接粘贴 Excel 数据")
     
     edited_df = st.data_editor(
