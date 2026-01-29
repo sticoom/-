@@ -6,7 +6,7 @@ import copy
 # ==========================================
 # 1. 基础配置
 # ==========================================
-st.set_page_config(page_title="智能调拨系统 V23.0 (精细化库位追踪)", layout="wide", page_icon="🦁")
+st.set_page_config(page_title="智能调拨系统 V24.0 (US策略修正版)", layout="wide", page_icon="🦁")
 
 hide_st_style = """
     <style>
@@ -18,7 +18,7 @@ hide_st_style = """
     </style>
     """
 st.markdown(hide_st_style, unsafe_allow_html=True)
-st.title("🦁 智能库存分配 V23.0 (精细化库位追踪版)")
+st.title("🦁 智能库存分配 V24.0 (US整单优先 -> 瀑布流兜底)")
 
 # ==========================================
 # 2. 数据清洗与辅助函数
@@ -81,22 +81,17 @@ def load_and_find_header(file, type_tag):
         return None, f"读取错误: {str(e)}"
 
 # ==========================================
-# 3. 核心：库存管理器 (V23 重构版)
+# 3. 核心：库存管理器 (精细化追踪)
 # ==========================================
 class InventoryManager:
     def __init__(self, df_inv, df_po):
-        # 结构变更: self.stock[sku][fnsku][wh_type] = List[Dict]
-        # Dict 包含: {qty, raw_name, zone}
+        # 结构: self.stock[sku][fnsku][wh_type] = List[Dict]
         self.stock = {} 
         self.po = {}
         self.cleaning_logs = []
         
         self._init_inventory(df_inv)
         self._init_po(df_po)
-        
-        # 深度拷贝用于快照逻辑比较复杂，这里简化处理：
-        # 我们用一个 helper 方法实时计算当前库存总量作为快照
-        self.initial_snapshot = {} # 可以在初始化后遍历一次生成，或者动态生成
 
     def _init_inventory(self, df):
         if df is None or df.empty: return
@@ -105,7 +100,8 @@ class InventoryManager:
         c_sku = next((c for c in df.columns if 'SKU' in c.upper()), None)
         c_fnsku = next((c for c in df.columns if 'FNSKU' in c.upper()), None)
         c_wh = next((c for c in df.columns if '仓库' in c), None)
-        # 库区列识别: 优先找"库区", 其次"库位", "Location", "Zone"
+        
+        # 库区/库位列识别
         c_zone = next((c for c in df.columns if '库区' in c), None)
         if not c_zone:
             c_zone = next((c for c in df.columns if any(k in c.upper() for k in ['库位', 'ZONE', 'LOCATION'])), None)
@@ -180,7 +176,6 @@ class InventoryManager:
         if sku in self.stock:
             for f in self.stock[sku]:
                 for w_type in ['深仓', '外协', '云仓']:
-                    # 累加列表中的数量
                     total = sum(item['qty'] for item in self.stock[sku][f].get(w_type, []))
                     res[w_type] += total
         return res
@@ -211,7 +206,6 @@ class InventoryManager:
         qty_remain = qty_needed
         breakdown_notes = []
         used_sources = []
-        # 详细记录加工来源信息
         process_details = {'raw_wh': [], 'zone': [], 'fnsku': [], 'qty': 0}
         deduction_log = [] 
         
@@ -224,9 +218,7 @@ class InventoryManager:
                 if sku in self.stock:
                     # --- A. 优先同 FNSKU ---
                     if target_fnsku in self.stock[sku]:
-                        # 遍历该仓库类型下的所有记录条目
                         items = self.stock[sku][target_fnsku].get(src_name, [])
-                        # 倒序遍历方便删除或修改，或直接遍历修改
                         for item in items:
                             if qty_remain <= 0: break
                             avail = item['qty']
@@ -278,7 +270,7 @@ class InventoryManager:
         return qty_needed - qty_remain, breakdown_notes, used_sources, process_details, deduction_log
 
 # ==========================================
-# 4. 主逻辑流程
+# 4. 主逻辑流程 (含 US 策略修正)
 # ==========================================
 def run_allocation(df_input, inv_mgr, df_plan, mapping):
     tasks = []
@@ -359,28 +351,37 @@ def run_allocation(df_input, inv_mgr, df_plan, mapping):
         proc = {'raw_wh': [], 'zone': [], 'fnsku': [], 'qty': 0}
         
         if not is_us:
-            # Non-US
+            # Non-US: 纯瀑布流 (深 > 外 > 云 > PO)
+            strategy_name = "Non-US 瀑布流"
             strat = [('stock', '深仓'), ('stock', '外协'), ('stock', '云仓'), ('po', '采购订单')]
             filled, notes, srcs, proc, d_logs = inv_mgr.execute_deduction(sku, fnsku, qty, strat)
             debug_info = d_logs
         else:
-            # US: 整单优先 -> 失败则待下单
+            # US: 整单优先 -> 瀑布流兜底
+            strategy_name = "US 整单+兜底"
             candidates = [('stock', '外协'), ('stock', '云仓'), ('po', '采购订单'), ('stock', '深仓')]
+            
+            # Step 1: 检测整单
             whole_match, check_logs = inv_mgr.check_whole_match_debug(sku, fnsku, qty, candidates)
             debug_info.extend(check_logs)
             
             if whole_match:
+                # 命中整单
                 filled, notes, srcs, proc, d_logs = inv_mgr.execute_deduction(sku, fnsku, qty, whole_match)
+                debug_info.append(f"命中整单: {whole_match[0][1]} -> 扣减成功")
                 debug_info.extend(d_logs)
             else:
-                filled = 0
-                notes = [f"待下单(需{to_int(qty)})"]
-                srcs = []
-                debug_info.append("无单一仓库满足 -> 转为待下单")
+                # Step 2: 失败 -> 启动瀑布流兜底
+                # 顺序: 外 > 云 > PO > 深
+                debug_info.append("无单一仓库满足 -> 启动瀑布流兜底")
+                strat_fallback = [('stock', '外协'), ('stock', '云仓'), ('po', '采购订单'), ('stock', '深仓')]
+                filled, notes, srcs, proc, d_logs = inv_mgr.execute_deduction(sku, fnsku, qty, strat_fallback)
+                debug_info.extend(d_logs)
         
         calc_logs.append({
             "步骤": f"Tier {t['priority']}", "SKU": sku, "需求": to_int(qty),
             "库存快照": snap_str,
+            "策略": strategy_name,
             "计算详情": " || ".join(debug_info),
             "结果": f"发货 {to_int(filled)}"
         })
@@ -406,11 +407,8 @@ def run_allocation(df_input, inv_mgr, df_plan, mapping):
         if res:
             filled = res['filled']
             status_str = "+".join(sorted(set(res['srcs']))) if res['srcs'] else "待下单"
-            if not res['srcs']: status_str += f" (需{to_int(clean_number(row.get(col_qty, 0)))})"
+            if not res['srcs'] and filled == 0: status_str += f" (需{to_int(clean_number(row.get(col_qty, 0)))})"
             
-            # 格式化加工信息 (原始仓库名 & 库位)
-            # 使用 set 去重仓库名，但如果是不同库位可能需要保留
-            # 这里简单展示所有涉及的
             p_wh = "; ".join(list(set(res['proc']['raw_wh'])))
             p_zone = "; ".join(list(set(res['proc']['zone'])))
             p_fn = "; ".join(list(set(res['proc']['fnsku'])))
@@ -420,14 +418,14 @@ def run_allocation(df_input, inv_mgr, df_plan, mapping):
             snap = inv_mgr.get_snapshot(sku)
             
             total_short = sku_shortage_map.get(sku, 0)
-            short_stat = f"❌ 缺货 (总缺 {to_int(total_short)})" if total_short > 0 else "✅ 全满足"
+            short_stat = f"❌ 缺货 (该SKU总缺 {to_int(total_short)})" if total_short > 0 else "✅ 全满足"
             
             out_row.update({
                 "库存状态": status_str,
                 "最终发货数量": to_int(filled),
                 "缺货与否": short_stat,
-                "加工库区": p_wh,        # 显示原始仓库名
-                "加工库区_库位": p_zone, # 显示库位
+                "加工库区": p_wh,
+                "加工库区_库位": p_zone,
                 "加工FNSKU": p_fn,
                 "加工数量": p_qt,
                 "剩_深仓": to_int(snap['深仓']),
@@ -464,7 +462,7 @@ if 'df_demand' not in st.session_state:
 col_main, col_side = st.columns([75, 25])
 
 with col_main:
-    st.subheader("1. 需求填报 (V23.0 库位追踪版)")
+    st.subheader("1. 需求填报 (V24.0 修正版)")
     st.info("💡 请直接粘贴 Excel 数据")
     
     edited_df = st.data_editor(
@@ -498,7 +496,7 @@ with col_side:
     
     if st.button("🚀 开始计算", type="primary", use_container_width=True):
         if f_inv and f_po and not edited_df.empty:
-            with st.spinner("执行深层库位追踪计算..."):
+            with st.spinner("双重验证计算中..."):
                 df_inv_raw, err1 = load_and_find_header(f_inv, "库存")
                 df_po_raw, err2 = load_and_find_header(f_po, "PO")
                 df_plan_raw, _ = load_and_find_header(f_plan, "计划")
@@ -531,6 +529,6 @@ with col_side:
                         df_clean.to_excel(writer, sheet_name='清洗日志', index=False)
                         writer.sheets['分配结果'].freeze_panes(1, 0)
                     
-                    st.download_button("📥 下载完整结果.xlsx", buf.getvalue(), "V23_Result_Full.xlsx")
+                    st.download_button("📥 下载完整结果.xlsx", buf.getvalue(), "V24_Result_Full.xlsx")
         else:
             st.warning("请填写需求数据并上传库存文件")
