@@ -6,7 +6,7 @@ import copy
 # ==========================================
 # 1. 基础配置
 # ==========================================
-st.set_page_config(page_title="智能调拨系统 V22.2 (批次追踪版)", layout="wide", page_icon="🦁")
+st.set_page_config(page_title="智能调拨系统 V23.0 (精细化库位追踪)", layout="wide", page_icon="🦁")
 
 hide_st_style = """
     <style>
@@ -18,7 +18,7 @@ hide_st_style = """
     </style>
     """
 st.markdown(hide_st_style, unsafe_allow_html=True)
-st.title("🦁 智能库存分配 V22.2 (批次追踪 + 库区明细)")
+st.title("🦁 智能库存分配 V23.0 (精细化库位追踪版)")
 
 # ==========================================
 # 2. 数据清洗与辅助函数
@@ -62,6 +62,7 @@ def load_and_find_header(file, type_tag):
             df = pd.read_excel(file)
             
         header_idx = -1
+        # 扩大搜索范围
         for i, row in df.head(30).iterrows():
             row_str = " ".join([str(v).upper() for v in row.values])
             if "SKU" in row_str:
@@ -80,34 +81,42 @@ def load_and_find_header(file, type_tag):
         return None, f"读取错误: {str(e)}"
 
 # ==========================================
-# 3. 核心：库存管理器 (批次化升级)
+# 3. 核心：库存管理器 (V23 重构版)
 # ==========================================
 class InventoryManager:
     def __init__(self, df_inv, df_po):
-        # 结构升级：self.stock[sku][fnsku][type] = [{'name': '原名', 'qty': 100}, ...]
+        # 结构变更: self.stock[sku][fnsku][wh_type] = List[Dict]
+        # Dict 包含: {qty, raw_name, zone}
         self.stock = {} 
         self.po = {}
         self.cleaning_logs = []
         
         self._init_inventory(df_inv)
         self._init_po(df_po)
-        # 深度拷贝用于计算剩余时比较复杂，这里简化处理：计算快照时实时遍历剩余量
-        self.orig_snapshot = self.get_snapshot_all() # 记录初始状态用于对比(可选)
+        
+        # 深度拷贝用于快照逻辑比较复杂，这里简化处理：
+        # 我们用一个 helper 方法实时计算当前库存总量作为快照
+        self.initial_snapshot = {} # 可以在初始化后遍历一次生成，或者动态生成
 
     def _init_inventory(self, df):
         if df is None or df.empty: return
         
+        # 列识别
         c_sku = next((c for c in df.columns if 'SKU' in c.upper()), None)
         c_fnsku = next((c for c in df.columns if 'FNSKU' in c.upper()), None)
         c_wh = next((c for c in df.columns if '仓库' in c), None)
+        # 库区列识别: 优先找"库区", 其次"库位", "Location", "Zone"
+        c_zone = next((c for c in df.columns if '库区' in c), None)
+        if not c_zone:
+            c_zone = next((c for c in df.columns if any(k in c.upper() for k in ['库位', 'ZONE', 'LOCATION'])), None)
         
-        # 优先锁定“可用”
+        # 数量列识别 (锁定可用)
         c_qty = next((c for c in df.columns if '可用' in c), None)
         if not c_qty:
             c_qty = next((c for c in df.columns if '数量' in c or '库存' in c), None)
 
         if not (c_sku and c_wh and c_qty): 
-            self.cleaning_logs.append({"类型": "系统错误", "SKU": "-", "原因": "库存表缺少必要列"})
+            self.cleaning_logs.append({"类型": "错误", "原因": "库存表缺少关键列"})
             return
 
         for idx, row in df.iterrows():
@@ -116,12 +125,8 @@ class InventoryManager:
             sku = str(row.get(c_sku, '')).strip()
             
             # 黑名单
-            blacklist_keywords = ["沃尔玛", "WALMART", "TEMU"]
-            if any(k in w_name_norm for k in blacklist_keywords):
-                self.cleaning_logs.append({
-                    "类型": "库存过滤", "SKU": sku, 
-                    "原因": f"仓库名黑名单 ({w_name_raw})", "数据行号": idx+2
-                })
+            if any(k in w_name_norm for k in ["沃尔玛", "WALMART", "TEMU"]):
+                self.cleaning_logs.append({"类型": "库存过滤", "SKU": sku, "原因": f"黑名单仓库 ({w_name_raw})"})
                 continue
             
             if not sku: continue
@@ -129,25 +134,28 @@ class InventoryManager:
             f_raw = row.get(c_fnsku, '')
             fnsku = str(f_raw).strip() if pd.notna(f_raw) else ""
             qty = clean_number(row.get(c_qty, 0))
+            zone = str(row.get(c_zone, '')).strip() if c_zone else "-"
             
             if qty <= 0: continue
             
             w_type = normalize_wh_name(w_name_raw)
             
+            # 初始化结构
             if sku not in self.stock: self.stock[sku] = {}
-            if fnsku not in self.stock[sku]: self.stock[sku][fnsku] = {'深仓':[], '外协':[], '云仓':[], '采购订单':[], '其他':[]}
+            if fnsku not in self.stock[sku]: 
+                self.stock[sku][fnsku] = {'深仓':[], '外协':[], '云仓':[], '采购订单':[], '其他':[]}
             
-            # [升级] 存入批次对象，而非简单的整数相加
+            # 添加明细记录
             self.stock[sku][fnsku][w_type].append({
-                'name': w_name_raw, # 原始仓库名
-                'qty': qty
+                'qty': qty,
+                'raw_name': w_name_raw,
+                'zone': zone
             })
 
     def _init_po(self, df):
         if df is None or df.empty: return
         
         c_sku = next((c for c in df.columns if 'SKU' in c.upper()), None)
-        # 优先锁定“未入库”
         c_qty = next((c for c in df.columns if '未入库' in c), None)
         if not c_qty: c_qty = next((c for c in df.columns if '数量' in c), None)
         c_req = next((c for c in df.columns if '人' in c or '员' in c), None)
@@ -157,54 +165,35 @@ class InventoryManager:
         for idx, row in df.iterrows():
             sku = str(row.get(c_sku, '')).strip()
             if c_req:
-                req_raw = str(row.get(c_req, ''))
-                if any(b in req_raw for b in block_list): 
-                    self.cleaning_logs.append({
-                        "类型": "PO过滤", "SKU": sku, 
-                        "原因": f"黑名单人员 ({req_raw})", "数据行号": idx+2
-                    })
+                req = str(row.get(c_req, ''))
+                if any(b in req for b in block_list):
+                    self.cleaning_logs.append({"类型": "PO过滤", "SKU": sku, "原因": f"黑名单人员 ({req})"})
                     continue
+            
             qty = clean_number(row.get(c_qty, 0))
             if sku and qty > 0:
                 self.po[sku] = self.po.get(sku, 0) + qty
 
-    def get_avail_qty(self, sku, fnsku, w_type):
-        """计算特定类型下的总库存"""
-        if w_type == '采购订单' and fnsku == 'PO_POOL': # PO特殊处理
-            return self.po.get(sku, 0)
-        
-        total = 0
-        if sku in self.stock and fnsku in self.stock[sku]:
-            batches = self.stock[sku][fnsku].get(w_type, [])
-            for b in batches:
-                total += b['qty']
-        return total
-
     def get_snapshot(self, sku):
-        """获取当前库存快照 (聚合显示)"""
+        """计算当前库存总量"""
         res = {'深仓':0, '外协':0, '云仓':0, '采购订单': self.po.get(sku, 0)}
         if sku in self.stock:
             for f in self.stock[sku]:
                 for w_type in ['深仓', '外协', '云仓']:
-                    batches = self.stock[sku][f].get(w_type, [])
-                    for b in batches:
-                        res[w_type] += b['qty']
+                    # 累加列表中的数量
+                    total = sum(item['qty'] for item in self.stock[sku][f].get(w_type, []))
+                    res[w_type] += total
         return res
-        
-    def get_snapshot_all(self):
-        """全量快照"""
-        # 简单实现，用于占位
-        return {}
 
     def check_whole_match_debug(self, sku, target_fnsku, qty, candidates):
+        """寻找整单满足"""
         logs = []
         for src_type, src_name in candidates:
             total_avail = 0
             if src_type == 'stock':
                 if sku in self.stock:
-                    # 遍历该SKU下所有FNSKU的该类型仓库总和
                     for f in self.stock[sku]:
-                        total_avail += self.get_avail_qty(sku, f, src_name)
+                        total_avail += sum(item['qty'] for item in self.stock[sku][f].get(src_name, []))
             elif src_type == 'po':
                 total_avail = self.po.get(sku, 0)
             
@@ -213,67 +202,78 @@ class InventoryManager:
                 return [(src_type, src_name)], logs
             else:
                 logs.append(f"检查 {src_name}: 库存{to_int(total_avail)} < 需求{to_int(qty)} -> ❌ 不足")
-                
         return None, logs
 
     def execute_deduction(self, sku, target_fnsku, qty_needed, strategy_chain):
         """
-        执行扣减 (批次级)
+        核心扣减逻辑 (支持从列表中扣减并记录明细)
         """
         qty_remain = qty_needed
         breakdown_notes = []
         used_sources = []
-        # 新增：记录原始仓库名
-        process_details = {'wh_raw': [], 'wh_type': [], 'fnsku': [], 'qty': 0}
+        # 详细记录加工来源信息
+        process_details = {'raw_wh': [], 'zone': [], 'fnsku': [], 'qty': 0}
         deduction_log = [] 
         
         for src_type, src_name in strategy_chain:
             if qty_remain <= 0: break
             
-            # --- 逻辑 A: 优先同 FNSKU ---
-            if src_type == 'stock' and sku in self.stock and target_fnsku in self.stock[sku]:
-                batches = self.stock[sku][target_fnsku].get(src_name, [])
-                for b in batches:
-                    if qty_remain <= 0: break
-                    if b['qty'] > 0:
-                        take = min(qty_remain, b['qty'])
-                        b['qty'] -= take
-                        qty_remain -= take
-                        
-                        deduction_log.append(f"{src_name}[{b['name']}]直发(-{to_int(take)})")
-                        if src_name not in used_sources: used_sources.append(src_name)
-
-            # --- 逻辑 B: 加工 (异 FNSKU) ---
-            if src_type == 'stock' and qty_remain > 0 and sku in self.stock:
-                for other_f in self.stock[sku]:
-                    if other_f == target_fnsku: continue # 已处理过
-                    
-                    batches = self.stock[sku][other_f].get(src_name, [])
-                    for b in batches:
-                        if qty_remain <= 0: break
-                        if b['qty'] > 0:
-                            take = min(qty_remain, b['qty'])
-                            b['qty'] -= take
-                            qty_remain -= take
-                            
-                            deduction_log.append(f"{src_name}[{b['name']}]加工(-{to_int(take)})")
-                            if src_name not in used_sources: used_sources.append(src_name)
-                            
-                            # 记录详细加工信息
-                            process_details['wh_raw'].append(b['name']) # 原始仓库名
-                            process_details['wh_type'].append(src_name) # 归类
-                            process_details['fnsku'].append(other_f)
-                            process_details['qty'] += take
+            step_taken = 0
             
-            # --- 逻辑 C: PO ---
+            if src_type == 'stock':
+                if sku in self.stock:
+                    # --- A. 优先同 FNSKU ---
+                    if target_fnsku in self.stock[sku]:
+                        # 遍历该仓库类型下的所有记录条目
+                        items = self.stock[sku][target_fnsku].get(src_name, [])
+                        # 倒序遍历方便删除或修改，或直接遍历修改
+                        for item in items:
+                            if qty_remain <= 0: break
+                            avail = item['qty']
+                            if avail <= 0: continue
+                            
+                            take = min(avail, qty_remain)
+                            item['qty'] -= take
+                            qty_remain -= take
+                            step_taken += take
+                            deduction_log.append(f"{src_name}(直发,-{to_int(take)})")
+                    
+                    # --- B. 加工 (异 FNSKU) ---
+                    if qty_remain > 0:
+                        for other_f in self.stock[sku]:
+                            if other_f == target_fnsku: continue
+                            if qty_remain <= 0: break
+                            
+                            items = self.stock[sku][other_f].get(src_name, [])
+                            for item in items:
+                                if qty_remain <= 0: break
+                                avail = item['qty']
+                                if avail <= 0: continue
+                                
+                                take = min(avail, qty_remain)
+                                item['qty'] -= take
+                                qty_remain -= take
+                                step_taken += take
+                                
+                                # === 记录加工详情 ===
+                                breakdown_notes.append(f"{src_name}(加工)")
+                                process_details['raw_wh'].append(item['raw_name']) # 原始仓库名
+                                process_details['zone'].append(item['zone'])       # 库区
+                                process_details['fnsku'].append(other_f)
+                                process_details['qty'] += take
+                                deduction_log.append(f"{src_name}(加工,-{to_int(take)})")
+                                
             elif src_type == 'po':
                 avail = self.po.get(sku, 0)
-                if avail > 0:
-                    take = min(qty_remain, avail)
+                take = min(avail, qty_remain)
+                if take > 0:
                     self.po[sku] -= take
                     qty_remain -= take
+                    step_taken += take
                     deduction_log.append(f"PO(-{to_int(take)})")
-                    if '采购订单' not in used_sources: used_sources.append('采购订单')
+            
+            if step_taken > 0:
+                used_sources.append(src_name)
 
         return qty_needed - qty_remain, breakdown_notes, used_sources, process_details, deduction_log
 
@@ -305,10 +305,8 @@ def run_allocation(df_input, inv_mgr, df_plan, mapping):
                     
                     calc_logs.append({
                         "步骤": "Tier -1 (计划)", "SKU": sku, "国家": cty, "需求": to_int(qty),
-                        "分配前库存": f"深:{to_int(snap['深仓'])} 外:{to_int(snap['外协'])} 云:{to_int(snap['云仓'])} PO:{to_int(snap['采购订单'])}",
-                        "策略": "Non-US瀑布流",
-                        "计算详情": " -> ".join(logs) if logs else "无扣减",
-                        "结果": f"发货 {to_int(filled)}"
+                        "库存快照": f"深:{to_int(snap['深仓'])} 外:{to_int(snap['外协'])}",
+                        "计算详情": " -> ".join(logs)
                     })
 
     # --- 2. 任务拆解 ---
@@ -358,25 +356,21 @@ def run_allocation(df_input, inv_mgr, df_plan, mapping):
         filled = 0
         notes = []
         srcs = []
-        proc = {'wh_raw': [], 'wh_type': [], 'fnsku': [], 'qty': 0}
+        proc = {'raw_wh': [], 'zone': [], 'fnsku': [], 'qty': 0}
         
         if not is_us:
-            # Non-US: 瀑布流
-            strategy_name = "Non-US 瀑布流"
+            # Non-US
             strat = [('stock', '深仓'), ('stock', '外协'), ('stock', '云仓'), ('po', '采购订单')]
             filled, notes, srcs, proc, d_logs = inv_mgr.execute_deduction(sku, fnsku, qty, strat)
             debug_info = d_logs
-        
         else:
-            # US: 严格整单优先
-            strategy_name = "US 整单严格"
+            # US: 整单优先 -> 失败则待下单
             candidates = [('stock', '外协'), ('stock', '云仓'), ('po', '采购订单'), ('stock', '深仓')]
             whole_match, check_logs = inv_mgr.check_whole_match_debug(sku, fnsku, qty, candidates)
             debug_info.extend(check_logs)
             
             if whole_match:
                 filled, notes, srcs, proc, d_logs = inv_mgr.execute_deduction(sku, fnsku, qty, whole_match)
-                debug_info.append(f"命中整单 -> 扣减成功")
                 debug_info.extend(d_logs)
             else:
                 filled = 0
@@ -385,12 +379,10 @@ def run_allocation(df_input, inv_mgr, df_plan, mapping):
                 debug_info.append("无单一仓库满足 -> 转为待下单")
         
         calc_logs.append({
-            "步骤": f"Tier {t['priority']} ({t['tag']})", 
-            "SKU": sku, "国家": t['country'], "需求": to_int(qty),
-            "分配前库存": snap_str,
-            "策略": strategy_name,
+            "步骤": f"Tier {t['priority']}", "SKU": sku, "需求": to_int(qty),
+            "库存快照": snap_str,
             "计算详情": " || ".join(debug_info),
-            "结果": f"发货 {to_int(filled)}" if filled > 0 else "待下单"
+            "结果": f"发货 {to_int(filled)}"
         })
 
         results[rid] = {'filled': filled, 'notes': notes, 'srcs': srcs, 'proc': proc}
@@ -416,23 +408,26 @@ def run_allocation(df_input, inv_mgr, df_plan, mapping):
             status_str = "+".join(sorted(set(res['srcs']))) if res['srcs'] else "待下单"
             if not res['srcs']: status_str += f" (需{to_int(clean_number(row.get(col_qty, 0)))})"
             
-            p_wh_raw = ";".join(sorted(set(res['proc']['wh_raw']))) # 原始名
-            p_wh_type = ";".join(sorted(set(res['proc']['wh_type']))) # 归类名
-            p_fn = ";".join(res['proc']['fnsku'])
+            # 格式化加工信息 (原始仓库名 & 库位)
+            # 使用 set 去重仓库名，但如果是不同库位可能需要保留
+            # 这里简单展示所有涉及的
+            p_wh = "; ".join(list(set(res['proc']['raw_wh'])))
+            p_zone = "; ".join(list(set(res['proc']['zone'])))
+            p_fn = "; ".join(list(set(res['proc']['fnsku'])))
             p_qt = to_int(res['proc']['qty']) if res['proc']['qty'] > 0 else ""
             
             sku = str(row.get(col_sku, '')).strip()
             snap = inv_mgr.get_snapshot(sku)
             
             total_short = sku_shortage_map.get(sku, 0)
-            short_stat = f"❌ 缺货 (该SKU总缺 {to_int(total_short)})" if total_short > 0 else "✅ 全满足"
+            short_stat = f"❌ 缺货 (总缺 {to_int(total_short)})" if total_short > 0 else "✅ 全满足"
             
             out_row.update({
                 "库存状态": status_str,
                 "最终发货数量": to_int(filled),
                 "缺货与否": short_stat,
-                "加工库区": p_wh_raw,  # 客户要求的原始名
-                "库区": p_wh_type,     # 客户要求的归类名
+                "加工库区": p_wh,        # 显示原始仓库名
+                "加工库区_库位": p_zone, # 显示库位
                 "加工FNSKU": p_fn,
                 "加工数量": p_qt,
                 "剩_深仓": to_int(snap['深仓']),
@@ -450,13 +445,11 @@ def run_allocation(df_input, inv_mgr, df_plan, mapping):
     
     if not df_out.empty and col_sku in df_out.columns:
         df_out.sort_values(by=[col_sku], inplace=True)
-        # 调整列顺序
         base_cols = list(df_input.columns)
-        calc_cols = [
-            "库存状态", "最终发货数量", "缺货与否", 
-            "加工库区", "库区", "加工FNSKU", "加工数量", # 注意这里多了"库区"
-            "剩_深仓", "剩_外协", "剩_云仓", "剩_PO"
-        ]
+        # 调整列顺序
+        calc_cols = ["库存状态", "最终发货数量", "缺货与否", 
+                     "加工库区", "加工库区_库位", "加工FNSKU", "加工数量", 
+                     "剩_深仓", "剩_外协", "剩_云仓", "剩_PO"]
         final_cols = base_cols + [c for c in calc_cols if c not in base_cols]
         df_out = df_out[final_cols]
 
@@ -471,7 +464,7 @@ if 'df_demand' not in st.session_state:
 col_main, col_side = st.columns([75, 25])
 
 with col_main:
-    st.subheader("1. 需求填报 (V22.2)")
+    st.subheader("1. 需求填报 (V23.0 库位追踪版)")
     st.info("💡 请直接粘贴 Excel 数据")
     
     edited_df = st.data_editor(
@@ -505,7 +498,7 @@ with col_side:
     
     if st.button("🚀 开始计算", type="primary", use_container_width=True):
         if f_inv and f_po and not edited_df.empty:
-            with st.spinner("执行批次级计算..."):
+            with st.spinner("执行深层库位追踪计算..."):
                 df_inv_raw, err1 = load_and_find_header(f_inv, "库存")
                 df_po_raw, err2 = load_and_find_header(f_po, "PO")
                 df_plan_raw, _ = load_and_find_header(f_plan, "计划")
@@ -514,7 +507,6 @@ with col_side:
                 elif err2: st.error(err2)
                 else:
                     mgr = InventoryManager(df_inv_raw, df_po_raw)
-                    
                     final_df, df_calc, df_clean = run_allocation(edited_df, mgr, df_plan_raw, mapping)
                     
                     st.success("计算完成!")
@@ -529,21 +521,16 @@ with col_side:
                         
                     with tab2:
                         st.dataframe(df_calc, use_container_width=True)
-                        
                     with tab3:
-                        if not df_clean.empty:
-                            st.warning(f"过滤 {len(df_clean)} 条数据")
-                            st.dataframe(df_clean, use_container_width=True)
-                        else:
-                            st.success("数据完美！")
+                        st.dataframe(df_clean, use_container_width=True)
                     
                     buf = io.BytesIO()
                     with pd.ExcelWriter(buf, engine='xlsxwriter') as writer:
                         final_df.to_excel(writer, sheet_name='分配结果', index=False)
                         df_calc.to_excel(writer, sheet_name='运算日志', index=False)
-                        if not df_clean.empty: df_clean.to_excel(writer, sheet_name='清洗日志', index=False)
+                        df_clean.to_excel(writer, sheet_name='清洗日志', index=False)
                         writer.sheets['分配结果'].freeze_panes(1, 0)
                     
-                    st.download_button("📥 下载完整结果.xlsx", buf.getvalue(), "V22_2_Result.xlsx")
+                    st.download_button("📥 下载完整结果.xlsx", buf.getvalue(), "V23_Result_Full.xlsx")
         else:
             st.warning("请填写需求数据并上传库存文件")
