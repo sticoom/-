@@ -6,7 +6,7 @@ import copy
 # ==========================================
 # 1. 基础配置
 # ==========================================
-st.set_page_config(page_title="智能调拨系统 V30.1 (精细化展示版)", layout="wide", page_icon="🦁")
+st.set_page_config(page_title="库存智能调拨系统", layout="wide", page_icon="🦁")
 
 hide_st_style = """
     <style>
@@ -18,7 +18,7 @@ hide_st_style = """
     </style>
     """
 st.markdown(hide_st_style, unsafe_allow_html=True)
-st.title("🦁 智能库存分配 V30.1 (库存状态含数量详情)")
+st.title("🦁库存调拨系统")
 
 # ==========================================
 # 2. 数据清洗与辅助函数
@@ -510,7 +510,7 @@ if 'df_demand' not in st.session_state:
 col_main, col_side = st.columns([75, 25])
 
 with col_main:
-    st.subheader("1. 需求填报 (V30.1 精细化展示版)")
+    st.subheader("1. 需求填报")
     st.info("💡 请直接粘贴 Excel 数据")
     
     edited_df = st.data_editor(
