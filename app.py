@@ -6,7 +6,7 @@ import copy
 # ==========================================
 # 1. 基础配置
 # ==========================================
-st.set_page_config(page_title="库存智能调拨系统", layout="wide", page_icon="🦁")
+st.set_page_config(page_title="智能调拨系统 V31.0 (计划独立预扣)", layout="wide", page_icon="🦁")
 
 hide_st_style = """
     <style>
@@ -18,7 +18,7 @@ hide_st_style = """
     </style>
     """
 st.markdown(hide_st_style, unsafe_allow_html=True)
-st.title("🦁库存调拨系统")
+st.title("🦁 智能库存分配 V31.0 (提货计划精准预扣 + 全局统筹)")
 
 # ==========================================
 # 2. 数据清洗与辅助函数
@@ -58,6 +58,7 @@ def load_and_find_header(file, type_tag):
             df = pd.read_excel(file)
             
         header_idx = -1
+        # 扩大搜索范围以适应复杂表头
         for i, row in df.head(30).iterrows():
             row_str = " ".join([str(v).upper() for v in row.values])
             if "SKU" in row_str:
@@ -176,14 +177,12 @@ class InventoryManager:
 
     def execute_deduction(self, sku, target_fnsku, qty_needed, strategy_chain, mode='strict_only'):
         """
-        核心扣减逻辑 - 返回详细的使用统计字典
+        核心扣减逻辑
         """
         qty_remain = qty_needed
         breakdown_notes = []
         process_details = {'raw_wh': [], 'zone': [], 'fnsku': [], 'qty': 0}
         deduction_log = []
-        
-        # 新增：记录本次扣减的具体数量 {'外协': 100, '采购订单': 50}
         usage_breakdown = {}
         
         for src_type, src_name in strategy_chain:
@@ -208,7 +207,6 @@ class InventoryManager:
                 
                 # B. 混合 / 加工模式 (异 FNSKU)
                 if mode in ['mixed', 'process_only'] and (qty_remain > 0 or mode == 'process_only'):
-                    # 注意：如果 mixed 模式上面已经扣完了，这里 qty_remain 为0会自动跳过
                     if qty_remain > 0:
                         for other_f in self.stock[sku]:
                             if other_f == target_fnsku: continue
@@ -231,12 +229,12 @@ class InventoryManager:
 
             # --- PO 处理 ---
             elif src_type == 'po' and sku in self.po:
-                # A. 任意模式 / 严格模式 (匹配)
+                # A. 任意 / 严格
                 if mode in ['po_any', 'strict_only']:
                     targets = []
                     if mode == 'strict_only':
                         if target_fnsku in self.po[sku]: targets = [target_fnsku]
-                    else: # po_any
+                    else: 
                         targets = list(self.po[sku].keys())
                         
                     for f in targets:
@@ -253,7 +251,7 @@ class InventoryManager:
                             tag = "PO精准" if mode == 'strict_only' else "PO任意"
                             deduction_log.append(f"{tag}(-{to_int(take)})")
 
-                # B. 加工模式
+                # B. 加工
                 if mode == 'process_only' and qty_remain > 0:
                     for other_f in self.po[sku]:
                         if other_f == target_fnsku: continue
@@ -275,7 +273,6 @@ class InventoryManager:
                             deduction_log.append(f"PO加工(-{to_int(take)})")
             
             if step_taken > 0:
-                # 记录具体用了哪个仓库多少量
                 usage_breakdown[src_name] = usage_breakdown.get(src_name, 0) + step_taken
 
         return qty_remain, usage_breakdown, process_details, deduction_log
@@ -287,32 +284,88 @@ def run_allocation(df_input, inv_mgr, df_plan, mapping):
     tiers = {1: [], 2: [], 3: [], 4: []}
     calc_logs = []
     
-    # --- 1. 提货计划 ---
+    # 策略定义
+    strat_us = [('stock', '外协'), ('stock', '云仓'), ('stock', '深仓')] 
+    strat_non_us = [('stock', '深仓'), ('stock', '外协'), ('stock', '云仓')]
+    
+    # ===============================
+    # Phase 0: 提货计划 (Tier -1)
+    # ===============================
+    plan_output = []
+    
     if df_plan is not None and not df_plan.empty:
+        # 列名适配 (兼容 Order Demand / 订单需求)
         c_sku = next((c for c in df_plan.columns if 'SKU' in c.upper()), None)
-        c_qty = next((c for c in df_plan.columns if '数量' in c or '计划' in c), None)
         c_fnsku = next((c for c in df_plan.columns if 'FNSKU' in c.upper()), None)
+        c_country = next((c for c in df_plan.columns if '国家' in c), None)
+        # 优先找"订单需求"，没有再找"计划"或"数量"
+        c_qty = next((c for c in df_plan.columns if '订单需求' in c), None)
+        if not c_qty: c_qty = next((c for c in df_plan.columns if '计划' in c), None)
+        if not c_qty: c_qty = next((c for c in df_plan.columns if '数量' in c), None)
         
         if c_sku and c_qty:
-            for _, row in df_plan.iterrows():
+            for idx, row in df_plan.iterrows():
                 sku = str(row.get(c_sku, '')).strip()
                 f_raw = row.get(c_fnsku, '') if c_fnsku else ''
                 fnsku = str(f_raw).strip() if pd.notna(f_raw) else ""
                 qty = clean_number(row.get(c_qty, 0))
-                if qty > 0:
-                    snap = inv_mgr.get_snapshot(sku)
-                    # 计划表扣减
-                    strat_stock = [('stock', '深仓'), ('stock', '外协'), ('stock', '云仓')]
-                    rem, _, _, logs1 = inv_mgr.execute_deduction(sku, fnsku, qty, strat_stock, mode='mixed')
-                    rem, _, _, logs2 = inv_mgr.execute_deduction(sku, fnsku, rem, [('po', '采购订单')], mode='po_any')
+                country = str(row.get(c_country, '-'))
+                
+                if qty <= 0: continue
+                
+                # 计划策略：四轮全局 (确保精准匹配 FNSKU)
+                # 无论国家，都为了满足 FNSKU
+                # R1 Strict Stock -> R2 Strict PO -> R3 Process Stock -> R4 Process PO
+                
+                fill_total = 0
+                usage_total = {}
+                logs_total = []
+                
+                # 1. R1 Strict Stock
+                rem, usage, _, logs = inv_mgr.execute_deduction(sku, fnsku, qty, strat_stock := [('stock','深仓'),('stock','外协'),('stock','云仓')], 'strict_only')
+                fill_total += (qty - rem)
+                for k,v in usage.items(): usage_total[k] = usage_total.get(k,0)+v
+                logs_total.extend(logs)
+                
+                # 2. R2 Strict PO
+                if rem > 0:
+                    old_rem = rem
+                    rem, usage, _, logs = inv_mgr.execute_deduction(sku, fnsku, rem, [('po','采购订单')], 'strict_only')
+                    fill_total += (old_rem - rem)
+                    for k,v in usage.items(): usage_total[k] = usage_total.get(k,0)+v
+                    logs_total.extend(logs)
                     
-                    calc_logs.append({
-                        "步骤": "Tier -1 (计划)", "SKU": sku, "需求": to_int(qty),
-                        "库存快照": f"深:{to_int(snap['深仓'])} 外:{to_int(snap['外协'])} PO:{to_int(snap['采购订单'])}",
-                        "结果": f"扣减 {to_int(qty - rem)}"
-                    })
+                # 3. R3 Process Stock
+                if rem > 0:
+                    old_rem = rem
+                    rem, usage, _, logs = inv_mgr.execute_deduction(sku, fnsku, rem, strat_stock, 'process_only')
+                    fill_total += (old_rem - rem)
+                    for k,v in usage.items(): usage_total[k] = usage_total.get(k,0)+v
+                    logs_total.extend(logs)
+                    
+                # 4. R4 Process PO
+                if rem > 0:
+                    old_rem = rem
+                    rem, usage, _, logs = inv_mgr.execute_deduction(sku, fnsku, rem, [('po','采购订单')], 'process_only')
+                    fill_total += (old_rem - rem)
+                    for k,v in usage.items(): usage_total[k] = usage_total.get(k,0)+v
+                    logs_total.extend(logs)
+                
+                # 记录结果
+                status_parts = []
+                display_map = {'深仓':'深仓', '外协':'外协', '云仓':'云仓', '采购订单':'PO'}
+                for k in ['深仓','外协','云仓','采购订单']:
+                    val = usage_total.get(k, 0)
+                    if val > 0: status_parts.append(f"{display_map[k]}{to_int(val)}")
+                
+                plan_output.append({
+                    "国家": country, "SKU": sku, "FNSKU": fnsku, "计划需求": to_int(qty),
+                    "实际扣除": to_int(fill_total),
+                    "扣除明细": "+".join(status_parts),
+                    "缺口": to_int(rem) if rem > 0 else "-"
+                })
 
-    # --- 2. 任务初始化 ---
+    # --- 2. 需求任务初始化 ---
     col_tag = mapping['标签']
     col_country = mapping['国家']
     col_sku = mapping['SKU']
@@ -339,42 +392,34 @@ def run_allocation(df_input, inv_mgr, df_plan, mapping):
             'row_idx': idx, 'priority': priority,
             'sku': sku, 'fnsku': fnsku, 'qty': qty, 'country': country,
             'is_us': is_us, 'tag': tag,
-            'filled': 0, 
-            'usage': {}, # 记录具体使用量 {'外协': 100, ...}
+            'filled': 0, 'usage': {}, 
             'proc': {'raw_wh': [], 'zone': [], 'fnsku': [], 'qty': 0},
             'logs': []
         }
         tiers[priority].append(task)
 
     results_map = {}
-    strat_us = [('stock', '外协'), ('stock', '云仓'), ('stock', '深仓')] 
-    strat_non_us = [('stock', '深仓'), ('stock', '外协'), ('stock', '云仓')]
     
-    # --- 3. 梯队计算 ---
+    # --- 3. 需求梯队计算 (Phase 1-4) ---
+    def update_task(t, rem, usage, proc, logs):
+        step_fill = (t['qty'] - t['filled']) - rem
+        t['filled'] += step_fill
+        for k, v in usage.items(): t['usage'][k] = t['usage'].get(k, 0) + v
+        if logs: t['logs'].extend(logs)
+        if proc:
+            t['proc']['raw_wh'].extend(proc['raw_wh'])
+            t['proc']['zone'].extend(proc['zone'])
+            t['proc']['fnsku'].extend(proc['fnsku'])
+            t['proc']['qty'] += proc['qty']
+
     for p in range(1, 5):
         current_tasks = tiers[p]
         if not current_tasks: continue
         is_us_tier = (p == 2 or p == 4)
         
-        def update_task(t, rem, usage, proc, logs):
-            step_fill = (t['qty'] - t['filled']) - rem
-            t['filled'] += step_fill
-            # 合并 usage
-            for k, v in usage.items():
-                t['usage'][k] = t['usage'].get(k, 0) + v
-            # 合并 logs
-            if logs: t['logs'].extend(logs)
-            # 合并 proc
-            if proc:
-                t['proc']['raw_wh'].extend(proc['raw_wh'])
-                t['proc']['zone'].extend(proc['zone'])
-                t['proc']['fnsku'].extend(proc['fnsku'])
-                t['proc']['qty'] += proc['qty']
-
         if not is_us_tier:
-            # === Non-US: 瀑布流 (Global within Tier) ===
+            # === Non-US: 瀑布流 + PO任意 ===
             for t in current_tasks:
-                snap = inv_mgr.get_snapshot(t['sku'])
                 # R1+R2: Stock Mixed
                 rem, usage1, proc1, logs1 = inv_mgr.execute_deduction(t['sku'], t['fnsku'], t['qty'], strat_non_us, 'mixed')
                 update_task(t, rem, usage1, proc1, logs1)
@@ -383,10 +428,9 @@ def run_allocation(df_input, inv_mgr, df_plan, mapping):
                 rem, usage2, proc2, logs2 = inv_mgr.execute_deduction(t['sku'], t['fnsku'], rem, [('po', '采购订单')], 'po_any')
                 update_task(t, rem, usage2, proc2, logs2)
                 
-                if rem > 0: t['logs'].append(f"缺口 {to_int(rem)}")
                 results_map[t['row_idx']] = t
                 calc_logs.append({
-                    "步骤": f"Tier {p} (Non-US)", "SKU": t['sku'], "FNSKU": t['fnsku'], 
+                    "步骤": f"Tier {p} (Non-US)", "SKU": t['sku'], "需求": to_int(t['qty']),
                     "执行过程": " || ".join(t['logs']), "最终发货": to_int(t['filled'])
                 })
 
@@ -421,10 +465,9 @@ def run_allocation(df_input, inv_mgr, df_plan, mapping):
                 update_task(t, rem, usage, proc, [f"[R4]:{l}" for l in logs])
             
             for t in current_tasks:
-                if t['filled'] < t['qty']: t['logs'].append(f"缺口 {to_int(t['qty'] - t['filled'])}")
                 results_map[t['row_idx']] = t
                 calc_logs.append({
-                    "步骤": f"Tier {p} (US全局)", "SKU": t['sku'], "FNSKU": t['fnsku'], 
+                    "步骤": f"Tier {p} (US全局)", "SKU": t['sku'], "需求": to_int(t['qty']),
                     "执行过程": " || ".join(t['logs']), "最终发货": to_int(t['filled'])
                 })
 
@@ -444,8 +487,6 @@ def run_allocation(df_input, inv_mgr, df_plan, mapping):
         out_row = row.to_dict()
         
         if t:
-            # 格式化状态字符串：显示具体数量
-            # 顺序: 深 -> 外 -> 云 -> PO
             status_parts = []
             display_order = ['深仓', '外协', '云仓', '采购订单']
             display_map = {'深仓':'深仓库存', '外协':'外协仓库存', '云仓':'云仓库存', '采购订单':'采购订单'}
@@ -458,8 +499,8 @@ def run_allocation(df_input, inv_mgr, df_plan, mapping):
             status_str = "+".join(status_parts)
             if t['filled'] < t['qty']:
                 status_str += f"+待下单(缺{to_int(t['qty'] - t['filled'])})"
+            if not status_str: status_str = "待下单"
             
-            # 加工信息
             p_wh = "; ".join(list(set(t['proc']['raw_wh'])))
             p_zone = "; ".join(list(set(t['proc']['zone'])))
             p_fn = "; ".join(list(set(t['proc']['fnsku'])))
@@ -473,14 +514,9 @@ def run_allocation(df_input, inv_mgr, df_plan, mapping):
                 "库存状态": status_str,
                 "最终发货数量": to_int(t['filled']),
                 "缺货与否": short_stat,
-                "加工库区": p_wh,
-                "加工库区_库位": p_zone,
-                "加工FNSKU": p_fn,
-                "加工数量": p_qt,
-                "剩_深仓": to_int(snap['深仓']),
-                "剩_外协": to_int(snap['外协']),
-                "剩_云仓": to_int(snap['云仓']),
-                "剩_PO": to_int(snap['采购订单'])
+                "加工库区": p_wh, "加工库区_库位": p_zone, "加工FNSKU": p_fn, "加工数量": p_qt,
+                "剩_深仓": to_int(snap['深仓']), "剩_外协": to_int(snap['外协']),
+                "剩_云仓": to_int(snap['云仓']), "剩_PO": to_int(snap['采购订单'])
             })
         else:
              out_row.update({"库存状态": "-", "最终发货数量": 0, "缺货与否": "-"})
@@ -489,6 +525,7 @@ def run_allocation(df_input, inv_mgr, df_plan, mapping):
     df_out = pd.DataFrame(output_rows)
     df_calc_log = pd.DataFrame(calc_logs)
     df_clean_log = pd.DataFrame(inv_mgr.cleaning_logs)
+    df_plan_res = pd.DataFrame(plan_output)
     
     if not df_out.empty and col_sku in df_out.columns:
         df_out.sort_values(by=[col_sku], inplace=True)
@@ -499,7 +536,7 @@ def run_allocation(df_input, inv_mgr, df_plan, mapping):
         final_cols = base_cols + [c for c in calc_cols if c not in base_cols]
         df_out = df_out[final_cols]
 
-    return df_out, df_calc_log, df_clean_log
+    return df_out, df_calc_log, df_clean_log, df_plan_res
 
 # ==========================================
 # 5. UI 渲染
@@ -510,7 +547,7 @@ if 'df_demand' not in st.session_state:
 col_main, col_side = st.columns([75, 25])
 
 with col_main:
-    st.subheader("1. 需求填报")
+    st.subheader("1. 需求填报 (V31.0 计划独立版)")
     st.info("💡 请直接粘贴 Excel 数据")
     
     edited_df = st.data_editor(
@@ -540,43 +577,63 @@ with col_side:
     st.subheader("2. 库存文件")
     f_inv = st.file_uploader("库存表 (必含'可用')", type=['xlsx', 'xls', 'csv'])
     f_po = st.file_uploader("PO表 (必含'未入库')", type=['xlsx', 'xls', 'csv'])
-    f_plan = st.file_uploader("计划表", type=['xlsx', 'xls', 'csv'])
+    f_plan = st.file_uploader("计划表 (含'订单需求')", type=['xlsx', 'xls', 'csv'])
     
     if st.button("🚀 开始计算", type="primary", use_container_width=True):
         if f_inv and f_po and not edited_df.empty:
-            with st.spinner("执行逻辑运算中..."):
+            with st.spinner("执行 Tier + Global + Plan Pre-deduction 算法..."):
                 df_inv_raw, err1 = load_and_find_header(f_inv, "库存")
                 df_po_raw, err2 = load_and_find_header(f_po, "PO")
-                df_plan_raw, _ = load_and_find_header(f_plan, "计划")
+                
+                df_plan_raw = None
+                if f_plan:
+                    df_plan_raw, _ = load_and_find_header(f_plan, "计划")
                 
                 if err1: st.error(err1)
                 elif err2: st.error(err2)
                 else:
                     mgr = InventoryManager(df_inv_raw, df_po_raw)
-                    final_df, df_calc, df_clean = run_allocation(edited_df, mgr, df_plan_raw, mapping)
+                    final_df, df_calc, df_clean, df_plan_res = run_allocation(edited_df, mgr, df_plan_raw, mapping)
                     
                     st.success("计算完成!")
                     
-                    tab1, tab2, tab3 = st.tabs(["📋 分配结果", "🔍 运算日志", "🧹 清洗日志"])
+                    # 结果展示 Tabs
+                    tabs = ["📋 分配结果", "🔍 运算日志", "🧹 清洗日志"]
+                    if not df_plan_res.empty: tabs.insert(0, "📅 提货计划结果")
                     
-                    with tab1:
+                    tab_objs = st.tabs(tabs)
+                    
+                    # 计划结果
+                    if not df_plan_res.empty:
+                        with tab_objs[0]:
+                            st.write("### 提货计划扣减明细")
+                            st.dataframe(df_plan_res, use_container_width=True)
+                            
+                    # 主结果
+                    main_idx = 1 if not df_plan_res.empty else 0
+                    with tab_objs[main_idx]:
                         def highlight(row):
                             if "缺货" in str(row.get('缺货与否', '')): return ['background-color: #ffcdd2'] * len(row)
                             return [''] * len(row)
                         st.dataframe(final_df.style.apply(highlight, axis=1), use_container_width=True)
                         
-                    with tab2:
+                    # 运算日志
+                    with tab_objs[main_idx+1]:
                         st.dataframe(df_calc, use_container_width=True)
-                    with tab3:
+                    # 清洗日志
+                    with tab_objs[main_idx+2]:
                         st.dataframe(df_clean, use_container_width=True)
                     
+                    # Excel 下载
                     buf = io.BytesIO()
                     with pd.ExcelWriter(buf, engine='xlsxwriter') as writer:
                         final_df.to_excel(writer, sheet_name='分配结果', index=False)
+                        if not df_plan_res.empty:
+                            df_plan_res.to_excel(writer, sheet_name='提货计划结果', index=False)
                         df_calc.to_excel(writer, sheet_name='运算日志', index=False)
                         df_clean.to_excel(writer, sheet_name='清洗日志', index=False)
                         writer.sheets['分配结果'].freeze_panes(1, 0)
                     
-                    st.download_button("📥 下载完整结果.xlsx", buf.getvalue(), "V30_1_Result_Full.xlsx")
+                    st.download_button("📥 下载完整结果.xlsx", buf.getvalue(), "V31_Result_Full.xlsx")
         else:
             st.warning("请填写需求数据并上传库存文件")
