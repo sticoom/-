@@ -5,7 +5,7 @@ import io
 # ==========================================
 # 1. 基础配置
 # ==========================================
-st.set_page_config(page_title="智能调拨系统 V33.4 (终极修复版)", layout="wide", page_icon="🦁")
+st.set_page_config(page_title="智能调拨系统 V33.4 ", layout="wide", page_icon="🦁")
 
 hide_st_style = """
     <style>
@@ -17,7 +17,7 @@ hide_st_style = """
     </style>
     """
 st.markdown(hide_st_style, unsafe_allow_html=True)
-st.title("🦁 智能库存分配 V33.4 (精准防误判 + 双向统筹)")
+st.title("🦁 智能库存分配 V33.4")
 
 # ==========================================
 # 2. 数据清洗与辅助函数
