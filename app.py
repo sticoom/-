@@ -5,7 +5,7 @@ import io
 # ==========================================
 # 1. 基础配置
 # ==========================================
-st.set_page_config(page_title="智能调拨系统 V33.3 (精准锁定+SKU兜底)", layout="wide", page_icon="🦁")
+st.set_page_config(page_title="智能调拨系统 V33.4 (终极修复版)", layout="wide", page_icon="🦁")
 
 hide_st_style = """
     <style>
@@ -17,7 +17,7 @@ hide_st_style = """
     </style>
     """
 st.markdown(hide_st_style, unsafe_allow_html=True)
-st.title("🦁 智能库存分配 V33.3 (精准列识别 + SKU级兜底)")
+st.title("🦁 智能库存分配 V33.4 (精准防误判 + 双向统筹)")
 
 # ==========================================
 # 2. 数据清洗与辅助函数
@@ -46,6 +46,7 @@ def normalize_wh_name(name):
     return "其他" 
 
 def load_and_find_header(file):
+    """读取文件，修复表头误判问题"""
     if not file: return None, "未上传"
     try:
         file.seek(0)
@@ -57,24 +58,27 @@ def load_and_find_header(file):
         else:
             df = pd.read_excel(file)
             
-        header_idx = -1
-        for i, row in df.head(50).iterrows():
-            found = False
-            for v in row.values:
-                val_clean = str(v).upper().replace(' ', '').replace('\n', '').replace('\r', '')
-                if any(k in val_clean for k in ["SKU", "FNSKU", "编码", "未入库", "贴标要求", "数量"]):
-                    header_idx = i
-                    found = True
-                    break
-            if found: break
+        # 1. 判断原生的第一行表头是否已经对了
+        orig_cols = [str(c).upper().replace(' ', '') for c in df.columns]
+        has_sku = any("SKU" in c or "编码" in c for c in orig_cols)
         
-        if header_idx != -1:
-            df.columns = df.iloc[header_idx]
-            df = df.iloc[header_idx+1:]
+        if not has_sku:
+            # 2. 只有原生表头不对时，才向下搜索真正的表头
+            header_idx = -1
+            for i, row in df.head(30).iterrows():
+                # 严禁使用 "未入库" 等可能出现在数据里的状态词作为表头特征！
+                row_vals = [str(v).upper().replace(' ', '') for v in row.values]
+                if any("SKU" in v or "编码" in v for v in row_vals):
+                    header_idx = i
+                    break
+            
+            if header_idx != -1:
+                df.columns = df.iloc[header_idx]
+                df = df.iloc[header_idx+1:]
         
         df.reset_index(drop=True, inplace=True)
         
-        # 自动处理重复的列名
+        # 自动处理重复的列名，防止 Series 报错
         raw_cols = [str(c).strip() for c in df.columns]
         seen = {}
         new_cols = []
@@ -106,7 +110,6 @@ class InventoryManager:
         self._init_inbound(df_plan, '提货计划')
 
     def _match_col(self, df, keywords):
-        """修复：关键字优先匹配法，防止被'采购主体'等干扰列误导"""
         for k in keywords:
             for col in df.columns:
                 col_clean = str(col).upper().replace(' ', '').replace('\n', '').replace('\r', '')
@@ -125,7 +128,7 @@ class InventoryManager:
         c_qty = self._match_col(df, ['可用', '数量', '库存'])
 
         if not (c_sku and c_wh and c_qty): 
-            self.cleaning_logs.append({"类型": "错误(漏数据)", "SKU": "-", "原因": f"【库存表】未能识别到SKU/仓库/可用量列！系统列名: {list(df.columns)}"})
+            self.cleaning_logs.append({"类型": "错误(漏数据)", "SKU": "-", "原因": f"【库存表】未能识别到SKU/仓库/可用量列！列名: {list(df.columns)}"})
             return
 
         for idx, row in df.iterrows():
@@ -154,15 +157,13 @@ class InventoryManager:
     def _init_inbound(self, df, source_type):
         if df is None or df.empty: return
         
-        c_sku = self._match_col(df, ['SKU', '编码', '代码', '型号'])
+        c_sku = self._match_col(df, ['SKU', '编码', '代码', '型号', '商品'])
         c_fnsku = self._match_col(df, ['FNSKU', '贴标要求', '条码', '标签'])
-        
-        # 极严格的顺序匹配，第一优先找“未入库”，绝对避免被“采购主体”干扰
         c_qty = self._match_col(df, ['未入库', '未交', '在途', '数量', 'QTY', '需求'])
         c_req = self._match_col(df, ['需求人', '业务员', '人', '员'])
         
         if not c_sku or not c_qty:
-            self.cleaning_logs.append({"类型": "致命错误(漏数据)", "SKU": "-", "原因": f"【{source_type}表】未识别到核心列！系统列名: {list(df.columns)}"})
+            self.cleaning_logs.append({"类型": "致命错误(漏数据)", "SKU": "-", "原因": f"【{source_type}表】未识别到核心列！列名: {list(df.columns)}"})
             return
             
         self.cleaning_logs.append({"类型": "诊断(成功)", "SKU": "-", "原因": f"✅ 【{source_type}表】匹配列：SKU=[{c_sku}], FNSKU=[{c_fnsku}], 数量=[{c_qty}]"})
@@ -175,7 +176,7 @@ class InventoryManager:
             if source_type == '采购订单' and c_req:
                 req = str(row.get(c_req, ''))
                 if any(b in req for b in block_list):
-                    self.cleaning_logs.append({"类型": f"{source_type}过滤", "SKU": sku, "原因": f"黑名单人员 ({req})"})
+                    self.cleaning_logs.append({"类型": f"{source_type}过滤", "SKU": sku, "原因": f"黑名单 ({req})"})
                     continue
             
             qty = clean_number(row.get(c_qty, 0))
@@ -188,7 +189,6 @@ class InventoryManager:
                 self.inbound[sku][fnsku].append({'qty': qty, 'raw_name': source_type, 'zone': '-'})
 
     def get_total_supply(self, sku):
-        """SKU 维度的总供应量（Stock + Inbound）"""
         total = 0
         if sku in self.stock:
             for f in self.stock[sku]:
@@ -223,7 +223,7 @@ class InventoryManager:
             if qty_remain <= 0: break
             step_taken = 0
             
-            # --- 1. STOCK 扣减 ---
+            # --- STOCK 扣减 ---
             if src_type == 'stock' and sku in self.stock:
                 if mode in ['mixed', 'strict_only']:
                     if target_fnsku in self.stock[sku]:
@@ -254,7 +254,7 @@ class InventoryManager:
                                 process_details['qty'] += take
                                 deduction_log.append(f"{src_name}(加工,-{to_int(take)})")
 
-            # --- 2. 供应 (PO/Plan) 扣减 ---
+            # --- INBOUND 扣减 ---
             elif src_type == 'inbound' and sku in self.inbound:
                 if mode in ['inbound_any', 'strict_only']:
                     targets = [target_fnsku] if mode == 'strict_only' else list(self.inbound[sku].keys())
@@ -286,7 +286,7 @@ class InventoryManager:
                             step_taken += take
                             process_details['raw_wh'].append(src_name)
                             process_details['zone'].append('-')
-                            process_details['fnsku'].append(other_f) # 这里会记录下PO的"新品"等文字
+                            process_details['fnsku'].append(other_f)
                             process_details['qty'] += take
                             deduction_log.append(f"{src_name}加工(-{to_int(take)})")
             
@@ -306,13 +306,11 @@ def run_allocation(df_input, inv_mgr, mapping):
     col_country = mapping['国家']
     col_fnsku = mapping['FNSKU']
     
-    # 强制大写清理
     for idx in df_input.index:
         df_input.at[idx, col_sku] = str(df_input.at[idx, col_sku]).strip().upper()
         df_input.at[idx, col_fnsku] = str(df_input.at[idx, col_fnsku]).strip().upper()
 
-    # === Step 0. 全局供需预判 (SKU级兜底防误报) ===
-    # 考虑到PO里大量存在"新品"等通用标签，待下单必须按 SKU 汇总，否则会误报缺货
+    # === Step 0. 全局供需预判 (SKU级防误报) ===
     df_input['__clean_qty'] = df_input[col_qty].apply(clean_number)
     demand_summary = df_input.groupby(col_sku)['__clean_qty'].sum().to_dict()
     df_input.drop(columns=['__clean_qty'], inplace=True)
@@ -325,7 +323,7 @@ def run_allocation(df_input, inv_mgr, mapping):
         if gap > 0:
             order_list.append({
                 "SKU": sku, "总需求(SKU级)": to_int(req_qty),
-                "现有全盘供应(含通用PO)": to_int(total_supply), "建议真实下单数量": to_int(gap)
+                "现有全盘供应(含PO)": to_int(total_supply), "建议补货下单数量": to_int(gap)
             })
     df_order_advice = pd.DataFrame(order_list)
 
@@ -412,7 +410,7 @@ def run_allocation(df_input, inv_mgr, mapping):
             if rem > 0:
                 r, u, p, l = inv_mgr.execute_deduction(t['sku'], t['fnsku'], rem, strat_stock_us, 'process_only')
                 update_task(t, r, u, p, [f"[R3现货加工]:{x}" for x in l])
-        for t in tiers[2]: # R4: 供应加工 (兜底：会吃掉标注为"新品"的PO)
+        for t in tiers[2]: # R4: 供应加工
             rem = t['qty'] - t['filled']
             if rem > 0:
                 r, u, p, l = inv_mgr.execute_deduction(t['sku'], t['fnsku'], rem, strat_inbound, 'process_only')
@@ -484,7 +482,7 @@ if 'df_demand' not in st.session_state:
 col_main, col_side = st.columns([75, 25])
 
 with col_main:
-    st.subheader("1. 需求填报 (V33.3 强力清洗版)")
+    st.subheader("1. 需求填报 (V33.4 最终修复版)")
     edited_df = st.data_editor(st.session_state.df_demand, num_rows="dynamic", use_container_width=True, height=400)
     
     cols = list(edited_df.columns)
@@ -510,7 +508,7 @@ with col_side:
     
     if st.button("🚀 执行全局智能分配", type="primary", use_container_width=True):
         if f_inv and f_po and not edited_df.empty:
-            with st.spinner("执行供需预判及防抢占分配引擎..."):
+            with st.spinner("执行供需预判及分配引擎..."):
                 df_inv_raw, err1 = load_and_find_header(f_inv)
                 df_po_raw, err2 = load_and_find_header(f_po)
                 df_plan_raw, _ = load_and_find_header(f_plan)
@@ -521,15 +519,15 @@ with col_side:
                     mgr = InventoryManager(df_inv_raw, df_po_raw, df_plan_raw)
                     final_df, logs, cleans, order_advice = run_allocation(edited_df, mgr, mapping)
                     
-                    st.success("运算完成！👉 请查看【清洗诊断日志】以确认PO表是否匹配成功。")
+                    st.success("运算完成！👉 【重要】请查看最右侧标签页确认 PO 表匹配情况！")
                     
                     if not order_advice.empty:
-                        st.error(f"⚠️ 预警：发现 {len(order_advice)} 个需要真实补单的 SKU（已扣除所有通用备货）！")
+                        st.error(f"⚠️ 预警：发现 {len(order_advice)} 个需要真实补单的 SKU！")
                         st.dataframe(order_advice, use_container_width=True)
                     else:
-                        st.success("✅ 供需平衡，全盘在库及PO数量可满足所有需求（部分可能需贴标）。")
+                        st.success("✅ 供需平衡，全盘供应可满足所有需求。")
                     
-                    tab1, tab2, tab3 = st.tabs(["📋 分配结果明细", "🔍 运算逻辑日志", "🧹 清洗诊断日志(查漏必看)"])
+                    tab1, tab2, tab3 = st.tabs(["📋 分配明细", "🔍 逻辑日志", "✅ 数据诊断雷达(必看)"])
                     
                     with tab1:
                         def highlight(row):
@@ -543,10 +541,10 @@ with col_side:
                     buf = io.BytesIO()
                     with pd.ExcelWriter(buf, engine='xlsxwriter') as writer:
                         final_df.to_excel(writer, sheet_name='分配结果', index=False)
-                        if not order_advice.empty: order_advice.to_excel(writer, sheet_name='真实待下单清单', index=False)
+                        if not order_advice.empty: order_advice.to_excel(writer, sheet_name='待下单清单', index=False)
                         pd.DataFrame(logs).to_excel(writer, sheet_name='运算日志', index=False)
                         pd.DataFrame(cleans).to_excel(writer, sheet_name='清洗诊断日志', index=False)
                     
-                    st.download_button("📥 下载完整报告.xlsx", buf.getvalue(), "V33_3_Result.xlsx")
+                    st.download_button("📥 下载完整报告.xlsx", buf.getvalue(), "V33_4_Result.xlsx")
         else:
             st.warning("请在左侧填写需求数据，并在右侧上传库存和PO文件。")
