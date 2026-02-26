@@ -5,7 +5,7 @@ import io
 # ==========================================
 # 1. 基础配置
 # ==========================================
-st.set_page_config(page_title="智能调拨系统 V35.1 (白皮书定稿版)", layout="wide", page_icon="🦁")
+st.set_page_config(page_title="智能调拨系统 V35.2 (白皮书终极版)", layout="wide", page_icon="👑")
 
 hide_st_style = """
     <style>
@@ -17,7 +17,7 @@ hide_st_style = """
     </style>
     """
 st.markdown(hide_st_style, unsafe_allow_html=True)
-st.title("🦁 智能库存分配 V35.1 (全局同步 + 底层洗盘)")
+st.title("👑 智能库存分配 V35.2 (单仓整发 + 贯通分配引擎)")
 
 # ==========================================
 # 2. 数据清洗与辅助函数
@@ -91,7 +91,7 @@ def load_and_find_header(file):
         return None, f"读取错误: {str(e)}"
 
 # ==========================================
-# 3. 核心：库存管理器 (前置车间数据净化)
+# 3. 核心：库存管理器 (前置净化与去重)
 # ==========================================
 class InventoryManager:
     def __init__(self, df_inv, df_po, df_plan):
@@ -248,6 +248,14 @@ class InventoryManager:
         if sku in self.inbound:
             total += sum(i['qty'] for f in self.inbound[sku] for i in self.inbound[sku][f])
         return total
+        
+    def get_exact_qty(self, src_type, src_name, sku, fnsku):
+        """用于单仓防碎单判定的辅助函数：获取特定来源的精准数量"""
+        if src_type == 'stock':
+            return sum(i['qty'] for i in self.stock.get(sku, {}).get(fnsku, {}).get(src_name, []))
+        elif src_type == 'inbound':
+            return sum(i['qty'] for i in self.inbound.get(sku, {}).get(fnsku, []) if i['raw_name'] == src_name)
+        return 0
 
     def get_snapshot(self, sku):
         res = {'深仓':0, '外协':0, '云仓':0, '采购订单': 0, '提货计划': 0}
@@ -261,6 +269,15 @@ class InventoryManager:
                     if item['raw_name'] == '采购订单': res['采购订单'] += item['qty']
                     elif item['raw_name'] == '提货计划': res['提货计划'] += item['qty']
         return res
+
+    def get_other_fnsku_stock(self, sku, current_fnsku):
+        """为业务员提供后备底牌：查看除当前FNSKU外，还有多少现货"""
+        total = 0
+        if sku in self.stock:
+            for f in self.stock[sku]:
+                if f != current_fnsku:
+                    total += sum(i['qty'] for w in self.stock[sku][f] for i in self.stock[sku][f][w])
+        return total
 
     def execute_deduction(self, sku, target_fnsku, qty_needed, strategy_chain, mode='strict_only'):
         qty_remain = qty_needed
@@ -325,7 +342,7 @@ class InventoryManager:
                             process_details['zone'].append('-')
                             process_details['fnsku'].append(other_f)
                             process_details['qty'] += take
-                            deduction_log.append(f"{src_name}加工(-{to_int(take)})")
+                            deduction_log.append(f"{src_name}兜底加工(-{to_int(take)})")
             
             if step_taken > 0:
                 usage_breakdown[src_name] = usage_breakdown.get(src_name, 0) + step_taken
@@ -333,7 +350,7 @@ class InventoryManager:
         return qty_remain, usage_breakdown, process_details, deduction_log
 
 # ==========================================
-# 4. 主逻辑流程 (分配引擎)
+# 4. 主逻辑流程 (分配引擎 - V35.2 大贯通版)
 # ==========================================
 def run_allocation(df_input, inv_mgr, mapping):
     
@@ -363,15 +380,15 @@ def run_allocation(df_input, inv_mgr, mapping):
             order_list.append({
                 "SKU": sku, 
                 "总需求": to_int(req_qty),
-                "国内库存": to_int(snap['深仓'] + snap['外协'] + snap['云仓']),
-                "净PO未入库(已清洗)": to_int(snap['采购订单']),
+                "国内现货(总)": to_int(snap['深仓'] + snap['外协'] + snap['云仓']),
                 "提货计划总量": to_int(snap['提货计划']),
+                "净PO未入库(已清洗)": to_int(snap['采购订单']),
                 "总有效供应": to_int(total_supply),
                 "建议补单缺口": to_int(gap)
             })
     df_order_advice = pd.DataFrame(order_list)
 
-    # === Step 1. 任务统筹池 (全盘同频起跑) ===
+    # === Step 1. 任务统筹池 (小批量优先) ===
     tasks = []
     calc_logs = []
     
@@ -391,14 +408,10 @@ def run_allocation(df_input, inv_mgr, mapping):
             'filled': 0, 'usage': {}, 'proc': {'raw_wh': [], 'zone': [], 'fnsku': [], 'qty': 0}, 'logs': []
         })
 
-    tasks.sort(key=lambda x: 0 if '新增' in x['tag'] else 1)
+    # 核心更新：取消标签特权，严格执行最短作业优先 (SJF)
+    tasks.sort(key=lambda x: x['qty'])
     results_map = {}
     
-    strat_stock_us = [('stock', '外协'), ('stock', '云仓'), ('stock', '深仓')]
-    strat_stock_non_us = [('stock', '深仓'), ('stock', '外协'), ('stock', '云仓')]
-    strat_plan = [('inbound', '提货计划')]
-    strat_po = [('inbound', '采购订单')]
-
     def update_task(t, rem, usage, proc, logs):
         step_fill = (t['qty'] - t['filled']) - rem
         t['filled'] += step_fill
@@ -408,56 +421,52 @@ def run_allocation(df_input, inv_mgr, mapping):
             t['proc']['raw_wh'].extend(proc['raw_wh']); t['proc']['zone'].extend(proc['zone'])
             t['proc']['fnsku'].extend(proc['fnsku']); t['proc']['qty'] += proc['qty']
 
-    # === Step 2 & 3: 核心分配引擎 (6轮精密扫描) ===
+    # === Step 2 & 3: 核心分配引擎 (防碎单 + 3大阶段贯通) ===
     
-    # 【第一阶段：全局保精准】
-    for t in tasks: # Round 1: 全局现货精准
+    # 🚨 【前置绝杀：US 独享防碎单 / 单仓直发】
+    for t in tasks:
+        if t['is_us'] and (t['qty'] - t['filled'] > 0):
+            # US 专属扫描链
+            us_single_sources = [('stock', '外协'), ('stock', '云仓'), ('inbound', '提货计划'), ('inbound', '采购订单'), ('stock', '深仓')]
+            for stype, sname in us_single_sources:
+                av_qty = inv_mgr.get_exact_qty(stype, sname, t['sku'], t['fnsku'])
+                if av_qty >= t['qty']:
+                    r, u, p, l = inv_mgr.execute_deduction(t['sku'], t['fnsku'], t['qty'], [(stype, sname)], 'strict_only')
+                    update_task(t, r, u, p, [f"[US防碎单-整发]:{x}" for x in l])
+                    break # 一口吃饱，直接结束该行的分配
+
+    # 🏆 第一阶段：全通道精准贯通刮肉 (所有人抢精准标)
+    for t in tasks: 
         rem = t['qty'] - t['filled']
         if rem > 0:
-            strat = strat_stock_us if t['is_us'] else strat_stock_non_us
+            strat = [('stock', '外协'), ('stock', '云仓'), ('inbound', '提货计划'), ('inbound', '采购订单'), ('stock', '深仓')] if t['is_us'] else \
+                    [('stock', '深仓'), ('stock', '外协'), ('stock', '云仓'), ('inbound', '提货计划'), ('inbound', '采购订单')]
             r, u, p, l = inv_mgr.execute_deduction(t['sku'], t['fnsku'], rem, strat, 'strict_only')
-            update_task(t, r, u, p, [f"[R1现货精准]:{x}" for x in l])
-            
-    for t in tasks: # Round 2: 全局提货精准
-        rem = t['qty'] - t['filled']
-        if rem > 0:
-            r, u, p, l = inv_mgr.execute_deduction(t['sku'], t['fnsku'], rem, strat_plan, 'strict_only')
-            update_task(t, r, u, p, [f"[R2提货精准]:{x}" for x in l])
+            update_task(t, r, u, p, [f"[R1精准贯通]:{x}" for x in l])
 
-    # 【第二阶段：非 US 独享异标借用】
-    for t in tasks: # Round 3: 非US 现货跨标
+    # 🔄 第二阶段：非 US 独享异标借用 (换标加工)
+    for t in tasks: 
         if not t['is_us']:
             rem = t['qty'] - t['filled']
             if rem > 0:
-                r, u, p, l = inv_mgr.execute_deduction(t['sku'], t['fnsku'], rem, strat_stock_non_us, 'process_only')
-                update_task(t, r, u, p, [f"[R3现货跨标]:{x}" for x in l])
-                
-    for t in tasks: # Round 4: 非US 提货跨标
-        if not t['is_us']:
-            rem = t['qty'] - t['filled']
-            if rem > 0:
-                r, u, p, l = inv_mgr.execute_deduction(t['sku'], t['fnsku'], rem, strat_plan, 'process_only')
-                update_task(t, r, u, p, [f"[R4提货跨标]:{x}" for x in l])
+                strat = [('stock', '深仓'), ('stock', '外协'), ('stock', '云仓'), ('inbound', '提货计划')]
+                r, u, p, l = inv_mgr.execute_deduction(t['sku'], t['fnsku'], rem, strat, 'process_only')
+                update_task(t, r, u, p, [f"[R2非US异标加工]:{x}" for x in l])
 
-    # 【第三阶段：全局 PO 兜底】
-    for t in tasks: # Round 5: 全局 PO 精准
+    # 🛟 第三阶段：全局净 PO 兜底盲配
+    for t in tasks: 
         rem = t['qty'] - t['filled']
         if rem > 0:
-            r, u, p, l = inv_mgr.execute_deduction(t['sku'], t['fnsku'], rem, strat_po, 'strict_only')
-            update_task(t, r, u, p, [f"[R5采购精准]:{x}" for x in l])
-            
-    for t in tasks: # Round 6: 全局 PO 兜底
-        rem = t['qty'] - t['filled']
-        if rem > 0:
-            r, u, p, l = inv_mgr.execute_deduction(t['sku'], t['fnsku'], rem, strat_po, 'process_only')
-            update_task(t, r, u, p, [f"[R6采购兜底]:{x}" for x in l])
+            strat = [('inbound', '采购订单')]
+            r, u, p, l = inv_mgr.execute_deduction(t['sku'], t['fnsku'], rem, strat, 'process_only')
+            update_task(t, r, u, p, [f"[R3净PO盲配兜底]:{x}" for x in l])
 
     for t in tasks:
         if t['filled'] < t['qty']: t['logs'].append(f"缺口 {to_int(t['qty'] - t['filled'])}")
         results_map[t['row_idx']] = t
-        calc_logs.append({"属性": "US" if t['is_us'] else "非US", "SKU": t['sku'], "FNSKU": t['fnsku'], "国家": t['country'], "执行过程": " | ".join(t['logs']), "发货": to_int(t['filled'])})
+        calc_logs.append({"属性": "US" if t['is_us'] else "非US", "SKU": t['sku'], "FNSKU": t['fnsku'], "需求数": t['qty'], "执行过程": " | ".join(t['logs'])})
 
-    # === Step 4. 输出端与缺货联动 ===
+    # === Step 4. 输出端与缺货联动 (含备用透视眼) ===
     output_rows = []
     display_order = ['深仓', '外协', '云仓', '提货计划', '采购订单']
     display_map = {'深仓':'深仓库存', '外协':'外协仓库存', '云仓':'云仓库存', '提货计划':'提货计划', '采购订单':'采购订单'}
@@ -478,6 +487,7 @@ def run_allocation(df_input, inv_mgr, mapping):
                 val = t['usage'].get(k, 0)
                 if val > 0: 
                     s_text = f"{display_map[k]}{to_int(val)}"
+                    # 调拨回仓提示
                     if not t['is_us'] and k in ['外协', '云仓']: transfer_note = "需调回深仓"
                     status_parts.append(s_text)
             
@@ -494,18 +504,23 @@ def run_allocation(df_input, inv_mgr, mapping):
             total_short = sku_shortage_map.get(t['sku'], 0)
             short_stat = f"❌ 缺货 (该SKU总缺 {to_int(total_short)})" if total_short > 0 else "✅ 全满足"
             
+            # 👀 应急备选透视列 (防万一)
+            other_fnsku_stock = inv_mgr.get_other_fnsku_stock(t['sku'], t['fnsku'])
+            backup_eye = f"全网剩余 {to_int(other_fnsku_stock)} 个(需撕标)" if other_fnsku_stock > 0 else "无后备现货"
+
             out_row.update({
                 "库存状态": status_str,
                 "最终发货数量": to_int(t['filled']),
                 "采购订单数量": to_int(t['usage'].get('采购订单', 0)), 
                 "调拨提示": transfer_note,
+                "同SKU其他现货参考(防万一)": backup_eye,
                 "缺货与否": short_stat,
                 "加工库区": p_wh, "加工库区_库位": p_zone, "加工FNSKU": p_fn, "加工数量": p_qt,
                 "剩_深仓": to_int(snap['深仓']), "剩_外协": to_int(snap['外协']),
                 "剩_云仓": to_int(snap['云仓']), "剩_计划": to_int(snap['提货计划']), "剩_净PO": to_int(snap['采购订单'])
             })
         else:
-             out_row.update({"库存状态": "-", "最终发货数量": 0, "采购订单数量": 0, "调拨提示": "", "缺货与否": "-"})
+             out_row.update({"库存状态": "-", "最终发货数量": 0, "采购订单数量": 0, "调拨提示": "", "同SKU其他现货参考(防万一)": "-", "缺货与否": "-"})
         output_rows.append(out_row)
 
     return pd.DataFrame(output_rows), calc_logs, inv_mgr.cleaning_logs, df_order_advice
@@ -519,7 +534,7 @@ if 'df_demand' not in st.session_state:
 col_main, col_side = st.columns([75, 25])
 
 with col_main:
-    st.subheader("1. 需求填报 (V35.1 白皮书定稿版)")
+    st.subheader("1. 需求填报 (V35.2 终极贯通版)")
     edited_df = st.data_editor(st.session_state.df_demand, num_rows="dynamic", use_container_width=True, height=400)
     
     cols = list(edited_df.columns)
@@ -545,7 +560,7 @@ with col_side:
     
     if st.button("🚀 执行全局智能分配", type="primary", use_container_width=True):
         if f_inv and f_po and not edited_df.empty:
-            with st.spinner("执行独立数据净化及双向分配引擎..."):
+            with st.spinner("执行独立数据净化及防碎单分配引擎..."):
                 df_inv_raw, err1 = load_and_find_header(f_inv)
                 df_po_raw, err2 = load_and_find_header(f_po)
                 df_plan_raw, _ = load_and_find_header(f_plan)
@@ -556,7 +571,7 @@ with col_side:
                     mgr = InventoryManager(df_inv_raw, df_po_raw, df_plan_raw)
                     final_df, logs, cleans, order_advice = run_allocation(edited_df, mgr, mapping)
                     
-                    st.success("运算完成！👉 全局同步竞争标的，请查看日志核对！")
+                    st.success("运算完成！👉 数据清洗彻底分离，请查看【清洗诊断日志】！")
                     
                     if not order_advice.empty:
                         st.error(f"⚠️ 预警：发现 {len(order_advice)} 个需要真实补单的 SKU（已扣除提货计划的PO量）！")
@@ -564,7 +579,7 @@ with col_side:
                     else:
                         st.success("✅ 供需平衡，全盘供应可满足所有需求。")
                     
-                    tab1, tab2, tab3 = st.tabs(["📋 分配结果明细", "🔍 运算逻辑日志", "✅ 清洗诊断日志"])
+                    tab1, tab2, tab3 = st.tabs(["📋 分配结果明细", "🔍 运算逻辑日志", "✅ 清洗诊断日志(核心数据源)"])
                     
                     with tab1:
                         def highlight(row):
@@ -578,10 +593,10 @@ with col_side:
                     buf = io.BytesIO()
                     with pd.ExcelWriter(buf, engine='xlsxwriter') as writer:
                         final_df.to_excel(writer, sheet_name='分配结果', index=False)
-                        if not order_advice.empty: order_advice.to_excel(writer, sheet_name='待下单清单', index=False)
+                        if not order_advice.empty: order_advice.to_excel(writer, sheet_name='待下单清单(已去重)', index=False)
                         pd.DataFrame(logs).to_excel(writer, sheet_name='运算日志', index=False)
                         pd.DataFrame(cleans).to_excel(writer, sheet_name='清洗去重日志', index=False)
                     
-                    st.download_button("📥 下载完整报告.xlsx", buf.getvalue(), "V35_1_Result.xlsx")
+                    st.download_button("📥 下载完整报告.xlsx", buf.getvalue(), "V35_2_Result.xlsx")
         else:
             st.warning("请在左侧填写需求数据，并在右侧上传库存和PO文件。")
