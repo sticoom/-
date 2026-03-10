@@ -572,4 +572,57 @@ with col_main:
     st.write("🔧 **列映射配置**")
     c1, c2, c3, c4, c5 = st.columns(5)
     map_tag = c1.selectbox("标签列", cols, index=get_idx(['标签']))
-    map_country = c2.selectbox("国家列
+    map_country = c2.selectbox("国家列", cols, index=get_idx(['国家']))
+    map_sku = c3.selectbox("SKU列", cols, index=get_idx(['SKU']))
+    map_fnsku = c4.selectbox("FNSKU列", cols, index=get_idx(['FNSKU']))
+    map_qty = c5.selectbox("数量列", cols, index=get_idx(['数量', '需求']))
+    mapping = {'标签': map_tag, '国家': map_country, 'SKU': map_sku, 'FNSKU': map_fnsku, '数量': map_qty}
+
+with col_side:
+    st.subheader("2. 资源文件上传")
+    f_inv = st.file_uploader("A. 库存表 (在库)", type=['xlsx', 'xls', 'csv'])
+    f_po = st.file_uploader("B. 采购追踪表 (在途/PO)", type=['xlsx', 'xls', 'csv'])
+    f_plan = st.file_uploader("C. 提货计划表 (选填)", type=['xlsx', 'xls', 'csv'])
+    
+    if st.button("🚀 执行全局智能分配", type="primary", use_container_width=True):
+        if f_inv and f_po and not edited_df.empty:
+            with st.spinner("执行底层去重清洗及智能防爆仓引擎..."):
+                df_inv_raw, err1 = load_and_find_header(f_inv)
+                df_po_raw, err2 = load_and_find_header(f_po)
+                df_plan_raw, _ = load_and_find_header(f_plan)
+                
+                if err1: st.error(err1)
+                elif err2: st.error(err2)
+                else:
+                    mgr = InventoryManager(df_inv_raw, df_po_raw, df_plan_raw)
+                    final_df, logs, cleans, order_advice = run_allocation(edited_df, mgr, mapping)
+                    
+                    st.success("运算完成！👉 已增加【发货主体】和【调拨数量】！循环逻辑已回归稳固！")
+                    
+                    if not order_advice.empty:
+                        st.error(f"⚠️ 预警：发现 {len(order_advice)} 个需要真实补单的 SKU（已扣除提货计划的PO量）！")
+                        st.dataframe(order_advice, use_container_width=True)
+                    else:
+                        st.success("✅ 供需平衡，全盘供应可满足所有需求。")
+                    
+                    tab1, tab2, tab3 = st.tabs(["📋 分配结果明细", "🔍 运算逻辑日志(核对防爆仓)", "✅ 清洗诊断日志"])
+                    
+                    with tab1:
+                        def highlight(row):
+                            if "缺货" in str(row.get('缺货与否', '')): return ['background-color: #ffcdd2'] * len(row)
+                            return [''] * len(row)
+                        st.dataframe(final_df.style.apply(highlight, axis=1), use_container_width=True)
+                    
+                    with tab2: st.dataframe(pd.DataFrame(logs), use_container_width=True)
+                    with tab3: st.dataframe(pd.DataFrame(cleans), use_container_width=True)
+                    
+                    buf = io.BytesIO()
+                    with pd.ExcelWriter(buf, engine='xlsxwriter') as writer:
+                        final_df.to_excel(writer, sheet_name='分配结果', index=False)
+                        if not order_advice.empty: order_advice.to_excel(writer, sheet_name='待下单清单(已去重)', index=False)
+                        pd.DataFrame(logs).to_excel(writer, sheet_name='运算日志', index=False)
+                        pd.DataFrame(cleans).to_excel(writer, sheet_name='清洗去重日志', index=False)
+                    
+                    st.download_button("📥 下载完整报告.xlsx", buf.getvalue(), "V35_6_Result.xlsx")
+        else:
+            st.warning("请在左侧填写需求数据，并在右侧上传库存和PO文件。")
