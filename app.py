@@ -17,7 +17,7 @@ hide_st_style = """
     </style>
     """
 st.markdown(hide_st_style, unsafe_allow_html=True)
-st.title("👑 智能库存分配 V35.8 (聚合展示修复 + 防爆仓引擎)")
+st.title("👑 智能库存分配")
 
 # ==========================================
 # 2. 数据清洗与辅助函数
@@ -559,7 +559,7 @@ if 'df_demand' not in st.session_state:
 col_main, col_side = st.columns([75, 25])
 
 with col_main:
-    st.subheader("1. 需求填报 (V35.8 全景状态修复版)")
+    st.subheader("1. 需求填报 ")
     edited_df = st.data_editor(st.session_state.df_demand, num_rows="dynamic", use_container_width=True, height=400)
     
     cols = list(edited_df.columns)
