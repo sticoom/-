@@ -625,3 +625,4 @@ with col_side:
                     st.download_button("📥 下载完整报告.xlsx", buf.getvalue(), "V35_8_Result.xlsx")
         else:
             st.warning("请在左侧填写需求数据，并在右侧上传库存和PO文件。")
+
