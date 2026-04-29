@@ -152,19 +152,10 @@ class InventoryManager:
         c_sku = self._match_col(df, ['SKU', '编码', '代码', '型号'])
         c_fnsku = self._match_col(df, ['FNSKU', '贴标要求', '条码', '标签'])
         c_qty = self._match_col(df, ['未入库', '未交', '在途', '数量', 'QTY', '需求'])
-        c_req = self._match_col(df, ['需求人', '业务员', '人', '员'])
-        
         if not c_sku or not c_qty: return
-        block_list = ["陈丹丹", "张萍", "杨上儒", "陈炜填", "贝少婷", "詹翠萍"]
-        
+
         for idx, row in df.iterrows():
-            sku = str(row.get(c_sku, '')).strip().upper() 
-            
-            if c_req:
-                req = str(row.get(c_req, ''))
-                if any(b in req for b in block_list):
-                    self.cleaning_logs.append({"类型": "采购过滤", "SKU": sku, "原因": f"剔除黑名单需求人 ({req})"})
-                    continue
+            sku = str(row.get(c_sku, '')).strip().upper()
                     
             qty = clean_number(row.get(c_qty, 0))
             f_raw = row.get(c_fnsku, '')
@@ -625,4 +616,3 @@ with col_side:
                     st.download_button("📥 下载完整报告.xlsx", buf.getvalue(), "V35_8_Result.xlsx")
         else:
             st.warning("请在左侧填写需求数据，并在右侧上传库存和PO文件。")
-
