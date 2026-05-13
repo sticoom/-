@@ -5,19 +5,96 @@ import io
 # ==========================================
 # 1. 基础配置
 # ==========================================
-st.set_page_config(page_title="智能调拨系统 V35.8 (全状态聚合版)", layout="wide", page_icon="👑")
+st.set_page_config(page_title="智能调拨系统 V36.0", layout="wide", page_icon="📦")
 
-hide_st_style = """
+custom_css = """
     <style>
-    #MainMenu {visibility: hidden;}
-    footer {visibility: hidden;}
-    header {visibility: hidden;}
+    /* 全局 */
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+    html, body, [class*="css"] { font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+
+    #MainMenu, footer, header {visibility: hidden;}
     [data-testid="stToolbar"] {visibility: hidden !important; display: none !important; height: 0px !important;}
-    .block-container {padding-top: 1rem !important;}
+    .block-container {padding-top: 1.5rem !important; padding-bottom: 2rem !important; max-width: 1600px;}
+
+    /* 顶部 Banner */
+    .app-banner {
+        background: linear-gradient(135deg, #1e3a5f 0%, #2d5f8a 50%, #3a7bb8 100%);
+        padding: 1.2rem 2rem; border-radius: 12px; margin-bottom: 1.5rem;
+        box-shadow: 0 4px 15px rgba(30,58,95,0.3);
+    }
+    .app-banner h1 {color: #fff; font-size: 1.6rem; font-weight: 700; margin: 0; letter-spacing: 0.5px;}
+    .app-banner p {color: rgba(255,255,255,0.8); font-size: 0.85rem; margin: 0.3rem 0 0 0;}
+    .version-badge {
+        display: inline-block; background: rgba(255,255,255,0.2); color: #fff;
+        padding: 2px 10px; border-radius: 20px; font-size: 0.75rem; font-weight: 500; margin-left: 10px;
+    }
+
+    /* 卡片容器 */
+    .card {
+        background: #fff; border: 1px solid #e8ecf1; border-radius: 10px;
+        padding: 1.2rem 1.5rem; margin-bottom: 1rem;
+        box-shadow: 0 1px 4px rgba(0,0,0,0.06);
+    }
+    .card-title {
+        font-size: 0.95rem; font-weight: 600; color: #1e3a5f;
+        margin-bottom: 0.8rem; padding-bottom: 0.5rem;
+        border-bottom: 2px solid #e8ecf1; display: flex; align-items: center; gap: 8px;
+    }
+    .card-title .icon { font-size: 1.1rem; }
+
+    /* 上传区标记 */
+    .upload-ready { border-left: 3px solid #28a745; }
+    .upload-empty { border-left: 3px solid #dee2e6; }
+
+    /* 按钮 */
+    .stButton > button[kind="primary"] {
+        background: linear-gradient(135deg, #1e3a5f, #3a7bb8) !important;
+        border: none !important; border-radius: 8px !important;
+        font-weight: 600 !important; font-size: 1rem !important;
+        padding: 0.7rem 1.5rem !important; letter-spacing: 0.5px;
+        box-shadow: 0 3px 10px rgba(30,58,95,0.3) !important;
+        transition: all 0.2s ease !important;
+    }
+    .stButton > button[kind="primary"]:hover {
+        box-shadow: 0 5px 18px rgba(30,58,95,0.4) !important;
+        transform: translateY(-1px) !important;
+    }
+
+    /* Tab 样式 */
+    .stTabs [data-baseweb="tab-list"] { gap: 4px; }
+    .stTabs [data-baseweb="tab"] {
+        border-radius: 8px 8px 0 0 !important; padding: 8px 20px !important;
+        font-weight: 500 !important;
+    }
+    .stTabs [aria-selected="true"] {
+        background: #fff !important; border-bottom: 2px solid #1e3a5f !important;
+    }
+
+    /* 状态徽标 */
+    .status-tag {
+        display: inline-block; padding: 2px 10px; border-radius: 12px;
+        font-size: 0.75rem; font-weight: 600;
+    }
+    .tag-required { background: #e8f4fd; color: #1e3a5f; }
+    .tag-optional { background: #f0f0f0; color: #666; }
+
+    /* 响应式 */
+    @media (max-width: 768px) {
+        .app-banner { padding: 1rem 1.2rem; }
+        .app-banner h1 { font-size: 1.3rem; }
+    }
     </style>
     """
-st.markdown(hide_st_style, unsafe_allow_html=True)
-st.title("👑 智能库存分配")
+st.markdown(custom_css, unsafe_allow_html=True)
+
+# Banner
+st.markdown("""
+    <div class="app-banner">
+        <h1>📦 智能库存分配系统 <span class="version-badge">V36.0</span></h1>
+        <p>多仓 · 多标 · 多渠道 ｜ 从数据清洗到智能分配的全链路自动化</p>
+    </div>
+""", unsafe_allow_html=True)
 
 # ==========================================
 # 2. 数据清洗与辅助函数
@@ -561,77 +638,101 @@ def run_allocation(df_input, inv_mgr, mapping):
 if 'df_demand' not in st.session_state:
     st.session_state.df_demand = pd.DataFrame(columns=["标签", "国家", "SKU", "FNSKU", "数量", "运营", "店铺", "备注"])
 
-col_main, col_side = st.columns([75, 25])
+col_main, col_side = st.columns([68, 32])
 
 with col_main:
-    st.subheader("1. 需求填报 ")
+    # --- 需求填报卡片 ---
+    st.markdown('<div class="card"><div class="card-title"><span class="icon">📋</span> 需求填报</div>', unsafe_allow_html=True)
     edited_df = st.data_editor(st.session_state.df_demand, num_rows="dynamic", use_container_width=True, height=400)
-    
+
     cols = list(edited_df.columns)
     def get_idx(cands):
         for i, c in enumerate(cols):
             if c in cands: return i
         return 0
 
-    st.write("🔧 **列映射配置**")
+    # --- 列映射配置 ---
+    st.markdown('<div class="card-title" style="margin-top:0.8rem;border-bottom:none;padding-bottom:0;"><span class="icon">⚙️</span> 列映射配置</div>', unsafe_allow_html=True)
     c1, c2, c3, c4, c5 = st.columns(5)
-    map_tag = c1.selectbox("标签列", cols, index=get_idx(['标签']))
-    map_country = c2.selectbox("国家列", cols, index=get_idx(['国家']))
-    map_sku = c3.selectbox("SKU列", cols, index=get_idx(['SKU']))
-    map_fnsku = c4.selectbox("FNSKU列", cols, index=get_idx(['FNSKU']))
-    map_qty = c5.selectbox("数量列", cols, index=get_idx(['数量', '需求']))
+    map_tag = c1.selectbox("标签列", cols, index=get_idx(['标签']), label_visibility="collapsed")
+    map_country = c2.selectbox("国家列", cols, index=get_idx(['国家']), label_visibility="collapsed")
+    map_sku = c3.selectbox("SKU列", cols, index=get_idx(['SKU']), label_visibility="collapsed")
+    map_fnsku = c4.selectbox("FNSKU列", cols, index=get_idx(['FNSKU']), label_visibility="collapsed")
+    map_qty = c5.selectbox("数量列", cols, index=get_idx(['数量', '需求']), label_visibility="collapsed")
     mapping = {'标签': map_tag, '国家': map_country, 'SKU': map_sku, 'FNSKU': map_fnsku, '数量': map_qty}
+    # 给 selectbox 加小标签
+    c1.markdown('<div style="text-align:center;font-size:0.75rem;color:#666;margin-top:-8px;">标签</div>', unsafe_allow_html=True)
+    c2.markdown('<div style="text-align:center;font-size:0.75rem;color:#666;margin-top:-8px;">国家</div>', unsafe_allow_html=True)
+    c3.markdown('<div style="text-align:center;font-size:0.75rem;color:#666;margin-top:-8px;">SKU</div>', unsafe_allow_html=True)
+    c4.markdown('<div style="text-align:center;font-size:0.75rem;color:#666;margin-top:-8px;">FNSKU</div>', unsafe_allow_html=True)
+    c5.markdown('<div style="text-align:center;font-size:0.75rem;color:#666;margin-top:-8px;">数量</div>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
 
 with col_side:
-    st.subheader("2. 资源文件上传")
-    f_inv = st.file_uploader("A. 库存表 (在库)", type=['xlsx', 'xls', 'csv'])
-    f_po = st.file_uploader("B. 采购追踪表 (在途/PO)", type=['xlsx', 'xls', 'csv'])
-    f_plan = st.file_uploader("C. 提货计划表 (选填)", type=['xlsx', 'xls', 'csv'])
-    
-    if st.button("🚀 执行全局智能分配", type="primary", use_container_width=True):
+    # --- 资源文件上传卡片 ---
+    st.markdown('<div class="card"><div class="card-title"><span class="icon">📁</span> 资源文件上传</div>', unsafe_allow_html=True)
+    inv_label = "A. 库存表 (在库)  ✅" if st.session_state.get('_f_inv') else "A. 库存表 (在库)"
+    po_label = "B. 采购追踪表 (在途/PO)  ✅" if st.session_state.get('_f_po') else "B. 采购追踪表 (在途/PO)"
+    plan_label = "C. 提货计划表 (选填)"
+
+    f_inv = st.file_uploader(inv_label, type=['xlsx', 'xls', 'csv'])
+    f_po = st.file_uploader(po_label, type=['xlsx', 'xls', 'csv'])
+    f_plan = st.file_uploader(plan_label, type=['xlsx', 'xls', 'csv'])
+
+    if f_inv: st.session_state['_f_inv'] = True
+    if f_po: st.session_state['_f_po'] = True
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # --- 执行按钮卡片 ---
+    st.markdown('<div class="card" style="text-align:center; background: linear-gradient(180deg, #f8fafc 0%, #fff 100%);">', unsafe_allow_html=True)
+    run_btn = st.button("🚀  执行全局智能分配", type="primary", use_container_width=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    if run_btn:
         col_country_name = mapping['国家']
         country_values = edited_df[col_country_name].fillna('').astype(str).str.strip()
         empty_country_rows = country_values[country_values == ''].index.tolist()
         if empty_country_rows:
             st.error(f"❌ 国家列为必填！第 {', '.join(str(i+1) for i in empty_country_rows)} 行未填写国家，请补全后再执行。")
         elif f_inv and f_po and not edited_df.empty:
-            with st.spinner("执行底层去重清洗及智能防爆仓引擎..."):
+            with st.spinner("⚙️ 执行底层去重清洗及智能防爆仓引擎..."):
                 df_inv_raw, err1 = load_and_find_header(f_inv)
                 df_po_raw, err2 = load_and_find_header(f_po)
                 df_plan_raw, _ = load_and_find_header(f_plan)
-                
+
                 if err1: st.error(err1)
                 elif err2: st.error(err2)
                 else:
                     mgr = InventoryManager(df_inv_raw, df_po_raw, df_plan_raw)
                     final_df, logs, cleans, order_advice = run_allocation(edited_df, mgr, mapping)
-                    
-                    st.success("运算完成！👉 状态拼接展示 Bug 已彻底修复，请核对！")
-                    
+
+                    st.success("✅ 运算完成！请核对分配结果。")
+
                     if not order_advice.empty:
                         st.error(f"⚠️ 预警：发现 {len(order_advice)} 个需要真实补单的 SKU！")
-                        st.dataframe(order_advice, use_container_width=True)
+                        with st.expander("📊 待下单清单", expanded=True):
+                            st.dataframe(order_advice, use_container_width=True)
                     else:
                         st.success("✅ 供需平衡，全盘供应可满足所有需求。")
-                    
+
                     tab1, tab2, tab3 = st.tabs(["📋 分配结果明细", "🔍 运算逻辑日志", "✅ 清洗诊断日志"])
-                    
+
                     with tab1:
                         def highlight(row):
                             if "缺货" in str(row.get('缺货与否', '')): return ['background-color: #ffcdd2'] * len(row)
                             return [''] * len(row)
                         st.dataframe(final_df.style.apply(highlight, axis=1), use_container_width=True)
-                    
+
                     with tab2: st.dataframe(pd.DataFrame(logs), use_container_width=True)
                     with tab3: st.dataframe(pd.DataFrame(cleans), use_container_width=True)
-                    
+
                     buf = io.BytesIO()
                     with pd.ExcelWriter(buf, engine='xlsxwriter') as writer:
                         final_df.to_excel(writer, sheet_name='分配结果', index=False)
                         if not order_advice.empty: order_advice.to_excel(writer, sheet_name='待下单清单(已去重)', index=False)
                         pd.DataFrame(logs).to_excel(writer, sheet_name='运算日志', index=False)
                         pd.DataFrame(cleans).to_excel(writer, sheet_name='清洗去重日志', index=False)
-                    
-                    st.download_button("📥 下载完整报告.xlsx", buf.getvalue(), "V35_8_Result.xlsx")
+
+                    st.download_button("📥 下载完整报告 (.xlsx)", buf.getvalue(), "V36_Result.xlsx", use_container_width=True)
         else:
-            st.warning("请在左侧填写需求数据，并在右侧上传库存和PO文件。")
+            st.warning("请填写需求数据，并上传库存表和采购追踪表。")
