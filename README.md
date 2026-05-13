@@ -1,6 +1,12 @@
-# 智能库存分配系统 V35.8
+# 智能库存分配系统 V36.0
 
 基于 Streamlit 构建的跨境电商智能库存调拨系统。针对多仓、多标（FNSKU）、多渠道的复杂库存场景，实现从数据清洗到智能分配的全链路自动化。
+
+> **V36.0 更新日志**
+> - **国家列必填校验**：需求表中国家列为必填项，未填写将阻止运算并提示具体行号
+> - **加工 FNSKU 智能优先级**：沃尔玛订单优先使用空白 FNSKU 加工；其他国家优先使用剩余库存量最大的 FNSKU，减少多标签混合加工
+> - **UI 全面重构**：渐变 Banner、卡片式布局、上传状态指示、优化视觉层次
+> - **列映射自动匹配**：移除界面上的列映射配置，改为后台自动识别
 
 ## 技术栈
 
@@ -19,7 +25,7 @@ streamlit run app.py
 
 | 文件 | 说明 | 必填 |
 |------|------|------|
-| 需求表 | 在页面表格中直接填写或粘贴，包含标签、国家、SKU、FNSKU、数量等列 | 是 |
+| 需求表 | 在页面表格中直接填写或粘贴，包含标签、国家、SKU、FNSKU、数量等列 | 是（**国家必填**） |
 | A. 库存表 | 在库现货数据（支持 xlsx / csv） | 是 |
 | B. 采购追踪表 | 采购订单 / 在途 PO 数据 | 是 |
 | C. 提货计划表 | 提货计划数据 | 否 |
@@ -33,7 +39,7 @@ streamlit run app.py
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                        用户界面层                            │
-│   需求填报表格  │  文件上传  │  列映射配置  │  结果展示/下载   │
+│   需求填报表格  │  文件上传  │  结果展示/下载   │
 ├─────────────────────────────────────────────────────────────┤
 │                       分配引擎层                             │
 │                                                             │
@@ -256,6 +262,23 @@ strat = [('stock', '外协'), ('stock', '云仓'), ('inbound', '提货计划'), 
 
 **逻辑**：如果阶段 1 没吃饱，允许跨越 FNSKU 限制，去同 SKU 下其他 FNSKU 的货来顶替。系统记录为"加工"操作，输出加工库区、库位、原始 FNSKU 等信息供仓库执行撕标贴标。
 
+**加工 FNSKU 优先级策略**（V36.0 新增）：
+
+系统根据订单的国家属性，智能选择优先用于加工的 FNSKU：
+
+| 国家类型 | 加工优先级策略 | 业务目的 |
+|----------|---------------|---------|
+| 沃尔玛（`沃尔玛`/`WALMART`，不区分大小写） | 优先使用空白 FNSKU（无标货） | 沃尔玛渠道适用空白标签发货 |
+| 其他国家（US、CA 等） | 优先使用剩余库存量最大的 FNSKU | 尽量从单一标签取货，避免多标签混合加工，减少仓库作业复杂度 |
+
+```python
+# execute_deduction 中的排序逻辑
+if is_walmart:
+    candidates.sort(key=lambda f: (0 if f == "" else 1, -remaining_qty))  # 空白FNSKU优先
+else:
+    candidates.sort(key=lambda f: -remaining_qty)  # 剩余量最大优先
+```
+
 **刮肉链路**（均为异标匹配）：
 
 ```
@@ -263,9 +286,8 @@ strat = [('stock', '外协'), ('stock', '云仓'), ('inbound', '提货计划'), 
 ```
 
 ```python
-# app.py:461
 strat = [('stock', '深仓'), ('stock', '外协'), ('stock', '云仓'), ('inbound', '提货计划')]
-r, u, p, l, eu = inv_mgr.execute_deduction(t['sku'], t['fnsku'], rem, strat, 'process_only')
+r, u, p, l, eu = inv_mgr.execute_deduction(t['sku'], t['fnsku'], rem, strat, 'process_only', is_walmart=t['is_walmart'])
 ```
 
 ---
@@ -277,9 +299,8 @@ r, u, p, l, eu = inv_mgr.execute_deduction(t['sku'], t['fnsku'], rem, strat, 'pr
 **逻辑**：最后的底牌。在净 PO 中寻找跨 FNSKU 的记录（未指定条码或标注"通用/新品"等），强行盲配扣减完成补足。
 
 ```python
-# app.py:469-471
 strat = [('inbound', '采购订单')]
-r, u, p, l, eu = inv_mgr.execute_deduction(t['sku'], t['fnsku'], rem, strat, 'process_only')
+r, u, p, l, eu = inv_mgr.execute_deduction(t['sku'], t['fnsku'], rem, strat, 'process_only', is_walmart=t['is_walmart'])
 ```
 
 ---
@@ -337,7 +358,7 @@ for f in self.stock[sku]:
 
 ## 列映射机制
 
-系统通过 `_match_col` 实现模糊列名匹配，支持不同格式的源文件：
+系统通过 `_match_col` 和 `get_idx` 实现模糊列名匹配，支持不同格式的源文件：
 
 | 逻辑字段 | 可识别的列名关键字 |
 |----------|-------------------|
@@ -347,7 +368,7 @@ for f in self.stock[sku]:
 | 库位 | `库位`、`库区`、`ZONE` |
 | 数量 | `可用`、`数量`、`库存`、`未入库`、`未交`、`在途` |
 
-页面上的列映射配置下拉框可手动覆盖自动识别结果。
+列映射在后台自动完成，无需用户手动配置。
 
 ---
 
