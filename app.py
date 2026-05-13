@@ -651,21 +651,14 @@ with col_main:
             if c in cands: return i
         return 0
 
-    # --- 列映射配置 ---
-    st.markdown('<div class="card-title" style="margin-top:0.8rem;border-bottom:none;padding-bottom:0;"><span class="icon">⚙️</span> 列映射配置</div>', unsafe_allow_html=True)
-    c1, c2, c3, c4, c5 = st.columns(5)
-    map_tag = c1.selectbox("标签列", cols, index=get_idx(['标签']), label_visibility="collapsed")
-    map_country = c2.selectbox("国家列", cols, index=get_idx(['国家']), label_visibility="collapsed")
-    map_sku = c3.selectbox("SKU列", cols, index=get_idx(['SKU']), label_visibility="collapsed")
-    map_fnsku = c4.selectbox("FNSKU列", cols, index=get_idx(['FNSKU']), label_visibility="collapsed")
-    map_qty = c5.selectbox("数量列", cols, index=get_idx(['数量', '需求']), label_visibility="collapsed")
-    mapping = {'标签': map_tag, '国家': map_country, 'SKU': map_sku, 'FNSKU': map_fnsku, '数量': map_qty}
-    # 给 selectbox 加小标签
-    c1.markdown('<div style="text-align:center;font-size:0.75rem;color:#666;margin-top:-8px;">标签</div>', unsafe_allow_html=True)
-    c2.markdown('<div style="text-align:center;font-size:0.75rem;color:#666;margin-top:-8px;">国家</div>', unsafe_allow_html=True)
-    c3.markdown('<div style="text-align:center;font-size:0.75rem;color:#666;margin-top:-8px;">SKU</div>', unsafe_allow_html=True)
-    c4.markdown('<div style="text-align:center;font-size:0.75rem;color:#666;margin-top:-8px;">FNSKU</div>', unsafe_allow_html=True)
-    c5.markdown('<div style="text-align:center;font-size:0.75rem;color:#666;margin-top:-8px;">数量</div>', unsafe_allow_html=True)
+    # --- 列映射配置（自动匹配，不展示） ---
+    mapping = {
+        '标签': cols[get_idx(['标签'])],
+        '国家': cols[get_idx(['国家'])],
+        'SKU': cols[get_idx(['SKU'])],
+        'FNSKU': cols[get_idx(['FNSKU'])],
+        '数量': cols[get_idx(['数量', '需求'])]
+    }
     st.markdown('</div>', unsafe_allow_html=True)
 
 with col_side:
