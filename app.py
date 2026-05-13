@@ -43,7 +43,11 @@ def normalize_wh_name(name):
     if "深" in n: return "深仓"
     if "外协" in n: return "外协"
     if "云" in n or "天源" in n: return "云仓"
-    return "其他" 
+    return "其他"
+
+def is_walmart_country(country):
+    c = normalize_str(country)
+    return "沃尔玛" in c or "WALMART" in c
 
 def load_and_find_header(file):
     if not file: return None, "未上传"
@@ -262,7 +266,7 @@ class InventoryManager:
         return total
 
     # 核心：精准捕捉每一笔扣减，绝不覆盖
-    def execute_deduction(self, sku, target_fnsku, qty_needed, strategy_chain, mode='strict_only'):
+    def execute_deduction(self, sku, target_fnsku, qty_needed, strategy_chain, mode='strict_only', is_walmart=False):
         qty_remain = qty_needed
         process_details = {'raw_wh': [], 'zone': [], 'fnsku': [], 'qty': 0}
         deduction_log = []
@@ -286,7 +290,12 @@ class InventoryManager:
                 
                 if mode in ['mixed', 'process_only'] and (qty_remain > 0 or mode == 'process_only'):
                     if qty_remain > 0:
-                        for other_f in self.stock[sku]:
+                        candidates = [f for f in self.stock[sku] if f != target_fnsku]
+                        if is_walmart:
+                            candidates.sort(key=lambda f: (0 if f == "" else 1, -sum(i['qty'] for w in self.stock[sku][f] for i in self.stock[sku][f][w])))
+                        else:
+                            candidates.sort(key=lambda f: -sum(i['qty'] for w in self.stock[sku][f] for i in self.stock[sku][f][w]))
+                        for other_f in candidates:
                             if other_f == target_fnsku: continue
                             if qty_remain <= 0: break
                             for item in self.stock[sku][other_f].get(src_name, []):
@@ -314,7 +323,12 @@ class InventoryManager:
                             deduction_log.append(f"{src_name}精准(-{to_int(take)})")
 
                 elif mode == 'process_only' and qty_remain > 0:
-                    for other_f in self.inbound[sku]:
+                    candidates = [f for f in self.inbound[sku] if f != target_fnsku]
+                    if is_walmart:
+                        candidates.sort(key=lambda f: (0 if f == "" else 1, -sum(i['qty'] for i in self.inbound[sku][f])))
+                    else:
+                        candidates.sort(key=lambda f: -sum(i['qty'] for i in self.inbound[sku][f]))
+                    for other_f in candidates:
                         if other_f == target_fnsku: continue
                         if qty_remain <= 0: break
                         for item in self.inbound[sku][other_f]:
@@ -389,8 +403,8 @@ def run_allocation(df_input, inv_mgr, mapping):
         is_us = 'US' in country.upper() or '美国' in country
             
         tasks.append({
-            'row_idx': idx, 'sku': sku, 'fnsku': fnsku, 'qty': qty, 
-            'country': country, 'is_us': is_us, 'tag': tag,
+            'row_idx': idx, 'sku': sku, 'fnsku': fnsku, 'qty': qty,
+            'country': country, 'is_us': is_us, 'is_walmart': is_walmart_country(country), 'tag': tag,
             'filled': 0, 'usage': {}, 'entity_usage': {}, 'proc': {'raw_wh': [], 'zone': [], 'fnsku': [], 'qty': 0}, 'logs': []
         })
 
@@ -457,7 +471,7 @@ def run_allocation(df_input, inv_mgr, mapping):
             rem = t['qty'] - t['filled']
             if rem > 0:
                 strat = [('stock', '深仓'), ('stock', '外协'), ('stock', '云仓'), ('inbound', '提货计划')]
-                r, u, p, l, eu = inv_mgr.execute_deduction(t['sku'], t['fnsku'], rem, strat, 'process_only')
+                r, u, p, l, eu = inv_mgr.execute_deduction(t['sku'], t['fnsku'], rem, strat, 'process_only', is_walmart=t['is_walmart'])
                 update_task(t, rem - r, u, p, [f"[R2非US异标加工]:{x}" for x in l], eu)
 
     # 🛟 阶段 3：全局净 PO 兜底盲配
@@ -465,7 +479,7 @@ def run_allocation(df_input, inv_mgr, mapping):
         rem = t['qty'] - t['filled']
         if rem > 0:
             strat = [('inbound', '采购订单')]
-            r, u, p, l, eu = inv_mgr.execute_deduction(t['sku'], t['fnsku'], rem, strat, 'process_only')
+            r, u, p, l, eu = inv_mgr.execute_deduction(t['sku'], t['fnsku'], rem, strat, 'process_only', is_walmart=t['is_walmart'])
             update_task(t, rem - r, u, p, [f"[R3净PO兜底盲配]:{x}" for x in l], eu)
 
     # 📊 阶段 4：汇总运算日志
@@ -575,7 +589,12 @@ with col_side:
     f_plan = st.file_uploader("C. 提货计划表 (选填)", type=['xlsx', 'xls', 'csv'])
     
     if st.button("🚀 执行全局智能分配", type="primary", use_container_width=True):
-        if f_inv and f_po and not edited_df.empty:
+        col_country_name = mapping['国家']
+        country_values = edited_df[col_country_name].fillna('').astype(str).str.strip()
+        empty_country_rows = country_values[country_values == ''].index.tolist()
+        if empty_country_rows:
+            st.error(f"❌ 国家列为必填！第 {', '.join(str(i+1) for i in empty_country_rows)} 行未填写国家，请补全后再执行。")
+        elif f_inv and f_po and not edited_df.empty:
             with st.spinner("执行底层去重清洗及智能防爆仓引擎..."):
                 df_inv_raw, err1 = load_and_find_header(f_inv)
                 df_po_raw, err2 = load_and_find_header(f_po)
