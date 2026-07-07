@@ -5,7 +5,7 @@ import io
 # ==========================================
 # 1. 基础配置
 # ==========================================
-st.set_page_config(page_title="智能调拨系统 V36.0", layout="wide", page_icon="📦")
+st.set_page_config(page_title="智能调拨系统 V36.1", layout="wide", page_icon="📦")
 
 custom_css = """
     <style>
@@ -91,7 +91,7 @@ st.markdown(custom_css, unsafe_allow_html=True)
 # Banner
 st.markdown("""
     <div class="app-banner">
-        <h1>📦 智能库存分配系统 <span class="version-badge">V36.0</span></h1>
+        <h1>📦 智能库存分配系统 <span class="version-badge">V36.1</span></h1>
         <p>多仓 · 多标 · 多渠道 ｜ 从数据清洗到智能分配的全链路自动化</p>
     </div>
 """, unsafe_allow_html=True)
@@ -533,12 +533,14 @@ def run_allocation(df_input, inv_mgr, mapping):
                         r, u, p, l, eu = inv_mgr.execute_deduction(t['sku'], t['fnsku'], t['qty'], [us_po], 'strict_only')
                         update_task(t, t['qty'] - r, u, p, [f"[US防碎单-PO兜底整发]:{x}" for x in l], eu)
 
-    # 🏆 阶段 1：全通道精准贯通刮肉
+    # 🏆 阶段 1：现货优先精准刮肉（绝不撕标，且绝不抢先用采购订单）
+    # 现货（含裸货直发）必须在采购订单之前被榨干：在途 PO 只兜底，不与现货争抢。
+    # 裸货(空FNSKU)的跨标消耗交给阶段2加工；同标现货在此阶段直发。
     for t in tasks:
         rem = t['qty'] - t['filled']
         if rem > 0:
-            strat = [('stock', '外协'), ('stock', '云仓'), ('inbound', '提货计划'), ('stock', '深仓'), ('inbound', '采购订单')] if t['is_us'] else \
-                    [('stock', '深仓'), ('stock', '外协'), ('stock', '云仓'), ('inbound', '提货计划'), ('inbound', '采购订单')]
+            strat = [('stock', '外协'), ('stock', '云仓'), ('inbound', '提货计划'), ('stock', '深仓')] if t['is_us'] else \
+                    [('stock', '深仓'), ('stock', '外协'), ('stock', '云仓'), ('inbound', '提货计划')]
             r, u, p, l, eu = inv_mgr.execute_deduction(t['sku'], t['fnsku'], rem, strat, 'strict_only')
             update_task(t, rem - r, u, p, [f"[R1精准刮肉]:{x}" for x in l], eu)
 
@@ -550,6 +552,15 @@ def run_allocation(df_input, inv_mgr, mapping):
                 strat = [('stock', '深仓'), ('stock', '外协'), ('stock', '云仓'), ('inbound', '提货计划')]
                 r, u, p, l, eu = inv_mgr.execute_deduction(t['sku'], t['fnsku'], rem, strat, 'process_only', is_walmart=t['is_walmart'])
                 update_task(t, rem - r, u, p, [f"[R2非US异标加工]:{x}" for x in l], eu)
+
+    # 🎯 阶段 2.5：同 FNSKU 采购订单精准兜底
+    # 现货（直发+加工）已榨干后，才动 PO；且同标 PO 必须先于跨标 PO 盲配。
+    for t in tasks:
+        rem = t['qty'] - t['filled']
+        if rem > 0:
+            strat = [('inbound', '采购订单')]
+            r, u, p, l, eu = inv_mgr.execute_deduction(t['sku'], t['fnsku'], rem, strat, 'strict_only')
+            update_task(t, rem - r, u, p, [f"[R2.5同标PO精准兜底]:{x}" for x in l], eu)
 
     # 🛟 阶段 3：全局净 PO 兜底盲配
     for t in tasks:
